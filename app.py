@@ -84,5 +84,9 @@ def handle_mychannels(ack, command, respond):
 
 app.command("/mychannels")(handle_mychannels)
 
+from slack_bolt.adapter.wsgi import SlackRequestHandler
+
+wsgi_app = SlackRequestHandler(app)
+
 if __name__ == "__main__":
     app.start(port=int(os.environ.get("PORT", 3000)))

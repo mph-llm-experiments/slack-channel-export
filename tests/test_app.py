@@ -98,3 +98,103 @@ def test_mychannels_non_admin_blocked():
 
     msg = respond.call_args[1]["text"]
     assert "Only workspace admins" in msg
+
+
+@patch.dict("os.environ", {
+    "SLACK_BOT_TOKEN": "xoxb-fake",
+    "SLACK_USER_TOKEN": "xoxp-fake",
+    "SLACK_SIGNING_SECRET": "fake-secret",
+})
+def test_mychannels_invalid_user():
+    from app import handle_mychannels
+
+    ack = MagicMock()
+    respond = MagicMock()
+    command = {"user_id": "U123", "text": ""}
+
+    mock_bot_client = MagicMock()
+    mock_bot_client.users_info.side_effect = Exception("user_not_found")
+
+    with patch("app.bot_client", mock_bot_client):
+        handle_mychannels(ack, command, respond)
+
+    msg = respond.call_args[1]["text"]
+    assert "Couldn't find that user" in msg
+
+
+@patch.dict("os.environ", {
+    "SLACK_BOT_TOKEN": "xoxb-fake",
+    "SLACK_USER_TOKEN": "xoxp-fake",
+    "SLACK_SIGNING_SECRET": "fake-secret",
+})
+def test_mychannels_channel_fetch_fails():
+    from app import handle_mychannels
+
+    ack = MagicMock()
+    respond = MagicMock()
+    command = {"user_id": "U123", "text": ""}
+
+    mock_bot_client = MagicMock()
+    mock_bot_client.users_info.return_value = {
+        "user": {"real_name": "Test User", "is_admin": False},
+    }
+    mock_user_client = MagicMock()
+    mock_user_client.users_conversations.side_effect = Exception("account_inactive")
+
+    with patch("app.bot_client", mock_bot_client), \
+         patch("app.user_client", mock_user_client):
+        handle_mychannels(ack, command, respond)
+
+    msg = respond.call_args[1]["text"]
+    assert "deactivated" in msg
+
+
+@patch.dict("os.environ", {
+    "SLACK_BOT_TOKEN": "xoxb-fake",
+    "SLACK_USER_TOKEN": "xoxp-fake",
+    "SLACK_SIGNING_SECRET": "fake-secret",
+})
+def test_mychannels_invalid_text():
+    from app import handle_mychannels
+
+    ack = MagicMock()
+    respond = MagicMock()
+    command = {"user_id": "U123", "text": "not-a-mention"}
+
+    handle_mychannels(ack, command, respond)
+
+    msg = respond.call_args[1]["text"]
+    assert "Usage" in msg
+
+
+@patch.dict("os.environ", {
+    "SLACK_BOT_TOKEN": "xoxb-fake",
+    "SLACK_USER_TOKEN": "xoxp-fake",
+    "SLACK_SIGNING_SECRET": "fake-secret",
+})
+def test_mychannels_pipe_delimited_mention():
+    """Slack can encode mentions as <@USERID|displayname>."""
+    from app import handle_mychannels
+
+    ack = MagicMock()
+    respond = MagicMock()
+    command = {"user_id": "UADMIN", "text": "<@UTARGET|jane>"}
+
+    mock_user_client = MagicMock()
+    mock_user_client.users_conversations.return_value = {
+        "channels": FAKE_CHANNELS,
+        "response_metadata": {"next_cursor": ""},
+    }
+
+    mock_bot_client = MagicMock()
+    mock_bot_client.users_info.side_effect = lambda user: {
+        "UADMIN": {"user": {"real_name": "Admin User", "is_admin": True}},
+        "UTARGET": {"user": {"real_name": "Jane Smith", "is_admin": False}},
+    }[user]
+
+    with patch("app.user_client", mock_user_client), \
+         patch("app.bot_client", mock_bot_client):
+        handle_mychannels(ack, command, respond)
+
+    msg = respond.call_args[1]["text"]
+    assert "Jane Smith" in msg

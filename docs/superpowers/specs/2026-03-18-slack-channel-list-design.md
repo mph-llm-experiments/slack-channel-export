@@ -61,6 +61,7 @@ When the self-service flow is used (`/mychannels` with no argument), the app can
 - `channels:read` — list public channels (user scope)
 - `groups:read` — list private channels (user scope)
 - `users:read` — look up user info for admin check (bot scope)
+- `chat:write` — DM full channel list when truncated (bot scope)
 
 **Endpoints used:**
 

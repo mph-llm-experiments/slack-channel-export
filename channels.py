@@ -30,3 +30,55 @@ def fetch_user_channels(client, user_id):
             break
 
     return all_channels
+
+
+def format_channel_list(channels, user_name):
+    """Format a list of channels into a readable Slack message.
+
+    Args:
+        channels: List of channel dicts from the Slack API.
+        user_name: Display name for the header.
+
+    Returns:
+        Formatted string for the Slack ephemeral response.
+    """
+    total = len(channels)
+    header = f"📋 Channels for @{user_name} ({total} channel{'s' if total != 1 else ''})"
+
+    if total == 0:
+        return f"{header}\n\nNo channels found."
+
+    public = sorted(
+        [c for c in channels if not c.get("is_private")],
+        key=lambda c: c["name"],
+    )
+    private = sorted(
+        [c for c in channels if c.get("is_private")],
+        key=lambda c: c["name"],
+    )
+
+    lines = [header, ""]
+
+    if public:
+        lines.append("Public:")
+        for c in public:
+            purpose = c.get("purpose", {}).get("value", "")
+            members = c.get("num_members", 0)
+            line = f"  #{c['name']} — {members} members"
+            if purpose:
+                line += f" — {purpose}"
+            lines.append(line)
+
+    if private:
+        if public:
+            lines.append("")
+        lines.append("Private:")
+        for c in private:
+            purpose = c.get("purpose", {}).get("value", "")
+            members = c.get("num_members", 0)
+            line = f"  🔒 #{c['name']} — {members} members"
+            if purpose:
+                line += f" — {purpose}"
+            lines.append(line)
+
+    return "\n".join(lines)

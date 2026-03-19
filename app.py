@@ -73,6 +73,14 @@ def handle_mychannels(ack, command, respond):
     message = format_channel_list(channels, user_name)
     respond(text=message, response_type="ephemeral")
 
+    # If truncated, DM the full untruncated list
+    if f"of {len(channels)} channels" in message and "full list sent via DM" in message:
+        full_message = format_channel_list(channels, user_name, max_length=None)
+        try:
+            bot_client.chat_postMessage(channel=requesting_user_id, text=full_message)
+        except Exception:
+            pass  # Best effort DM
+
 
 app.command("/mychannels")(handle_mychannels)
 

@@ -32,12 +32,15 @@ def fetch_user_channels(client, user_id):
     return all_channels
 
 
-def format_channel_list(channels, user_name):
+def format_channel_list(channels, user_name, max_length=40000):
     """Format a list of channels into a readable Slack message.
 
     Args:
         channels: List of channel dicts from the Slack API.
         user_name: Display name for the header.
+        max_length: Maximum character length of the returned message. If None,
+                    no truncation is applied (useful for DM copies). Defaults
+                    to 40000 (Slack's plain-text limit).
 
     Returns:
         Formatted string for the Slack ephemeral response.
@@ -81,4 +84,21 @@ def format_channel_list(channels, user_name):
                 line += f" — {purpose}"
             lines.append(line)
 
-    return "\n".join(lines)
+    message = "\n".join(lines)
+
+    if max_length is None or len(message) <= max_length:
+        return message
+
+    # Count how many channels made it into the truncated message
+    truncated_lines = [header, ""]
+    shown = 0
+    for line in lines[2:]:  # Skip header and blank line
+        candidate = "\n".join(truncated_lines + [line])
+        footer = f"\n\n(Showing {shown} of {total} channels — full list sent via DM)"
+        if len(candidate + footer) > max_length:
+            break
+        truncated_lines.append(line)
+        if line.startswith("  "):  # Actual channel lines start with indent
+            shown += 1
+
+    return "\n".join(truncated_lines) + f"\n\n(Showing {shown} of {total} channels — full list sent via DM)"

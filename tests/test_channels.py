@@ -53,3 +53,12 @@ def test_format_no_private_channels():
     result = format_channel_list(channels, "jane")
     assert "Public:" in result
     assert "Private:" not in result
+
+
+def test_format_truncates_long_list():
+    """When the message exceeds the limit, it should be truncated with a note."""
+    channels = [_make_channel(f"channel-{i:04d}", num_members=i, purpose=f"Purpose for channel {i}") for i in range(500)]
+    result = format_channel_list(channels, "jane", max_length=4000)  # Use small limit for testing
+    assert len(result) <= 4000
+    assert "showing" in result.lower()
+    assert "of 500" in result

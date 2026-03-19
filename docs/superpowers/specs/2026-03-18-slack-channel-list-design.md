@@ -37,7 +37,7 @@ User ──► Slack ──► Cloud Run (slash command handler) ──► Slack
 
 ### Request flow
 
-1. User invokes `/mychannels` (optionally with `@user` argument)
+1. User invokes `/mychannels` (optionally with `@user` argument — Slack encodes this as `<@USERID>` in the `text` field)
 2. Slack POSTs to the Cloud Run service URL
 3. App verifies the Slack request signature (handled by Slack Bolt)
 4. If a target user is specified:
@@ -49,17 +49,23 @@ User ──► Slack ──► Cloud Run (slash command handler) ──► Slack
 
 ### Slack API
 
-**Scopes required (bot token):**
+**Token strategy: user token via OAuth**
 
-- `commands` — register the slash command
-- `channels:read` — list public channels the user is in
-- `groups:read` — list private channels the user is in
-- `users:read` — look up user info for admin check
+A bot token with `groups:read` can only see private channels the bot has been invited to — which defeats the purpose. To get a complete channel list (including all private channels), the app uses a **user token** obtained via Slack OAuth.
+
+When the self-service flow is used (`/mychannels` with no argument), the app can use the invoking user's own user token. For the admin lookup flow (`/mychannels @jane`), the app needs a token with admin-level visibility. The simplest approach: the Slack app is installed by a workspace admin, and the **installing admin's user token** (with `channels:read` and `groups:read` user scopes) is stored and used for all `users.conversations` calls. This token can see all channels for any user.
+
+**Scopes required:**
+
+- `commands` — register the slash command (bot scope)
+- `channels:read` — list public channels (user scope)
+- `groups:read` — list private channels (user scope)
+- `users:read` — look up user info for admin check (bot scope)
 
 **Endpoints used:**
 
-- `users.conversations` — returns channels for a given user. Supports `user` parameter, `types` parameter (set to `public_channel,private_channel`). Paginated; must follow `next_cursor`.
-- `users.info` — returns user profile including `is_admin` field.
+- `users.conversations` — returns channels for a given user. Supports `user` parameter, `types` parameter (set to `public_channel,private_channel`). Paginated via `cursor`/`next_cursor`. Called with the admin **user token** to ensure full visibility.
+- `users.info` — returns user profile including `is_admin` field. Called with the **bot token**.
 
 ### Response format
 
@@ -95,12 +101,12 @@ Admin status is determined by the `is_admin` field from `users.info`.
 
 - **Platform:** GCP Cloud Run (scales to zero)
 - **Container:** Python 3.12 + gunicorn + slack-bolt
-- **Secrets:** Slack bot token (`SLACK_BOT_TOKEN`) and signing secret (`SLACK_SIGNING_SECRET`) stored as Cloud Run environment variables or GCP Secret Manager
+- **Secrets:** Slack bot token (`SLACK_BOT_TOKEN`), admin user token (`SLACK_USER_TOKEN`), and signing secret (`SLACK_SIGNING_SECRET`) stored as Cloud Run environment variables or GCP Secret Manager
 - **Slack app configuration:** Slash command URL pointed at the Cloud Run service URL + `/slack/events`
 
 ## Pagination
 
-`users.conversations` returns a max of 200 channels per call. The app must paginate using `cursor`/`next_cursor` to handle users in more than 200 channels. For very large lists, the Slack message response has a character limit (~3000 chars for ephemeral messages in blocks, ~40000 for plain text). If the list is too long for a single message, the app should truncate and note "showing N of M channels — full list sent via DM" and DM the complete list.
+`users.conversations` returns a default of 100 channels per call (max 1000 with the `limit` parameter). The app must paginate using `cursor`/`next_cursor` to handle users in more than 200 channels. For very large lists, the Slack message response has a character limit (~3000 chars for ephemeral messages in blocks, ~40000 for plain text). If the list is too long for a single message, the app should truncate and note "showing N of M channels — full list sent via DM" and DM the complete list.
 
 ## Error handling
 

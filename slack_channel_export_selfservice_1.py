@@ -191,6 +191,20 @@ _rejoin_sessions: EphemeralStore = EphemeralStore(
     ttl_seconds=_REJOIN_SESSION_TTL, max_size=500
 )
 
+_CSV_DANGEROUS_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _sanitize_csv_cell(value):
+    """Defuse CSV formula injection by prefixing risky cells with a single quote.
+
+    Excel/Sheets/Numbers interpret a leading =, +, -, @ (and some control chars)
+    as a formula. The leading quote forces text interpretation in all three.
+    """
+    if isinstance(value, str) and value and value[0] in _CSV_DANGEROUS_PREFIXES:
+        return "'" + value
+    return value
+
+
 USER_SCOPES = [
     "channels:read",
     "groups:read",
@@ -595,7 +609,13 @@ def slack_callback():
     buf = io.StringIO()
     writer = csv.DictWriter(buf, fieldnames=fieldnames)
     writer.writeheader()
-    writer.writerows(rows)
+    # Sanitize at write time only — leaves `rows` untouched so the markdown
+    # checklist below still renders channel names without a leading quote.
+    sanitized_rows = [
+        {k: _sanitize_csv_cell(v) for k, v in row.items()}
+        for row in rows
+    ]
+    writer.writerows(sanitized_rows)
     csv_bytes = buf.getvalue().encode("utf-8")
 
     md_bytes = build_markdown_checklist(rows).encode("utf-8")

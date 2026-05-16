@@ -139,6 +139,12 @@ gcloud beta iap web add-iam-policy-binding \
   OAuth handshakes.
 - `APP_ALLOW_INSECURE_COOKIES=1` — local-dev only. Without this, cookies are
   always set with the `Secure` flag. Do not set in production.
+- `FLASK_DEBUG=1` — local-dev only. Enables the Werkzeug interactive debugger.
+  The dev server only binds to 127.0.0.1, but never set this in any deployment.
+  Any truthy spelling works (`1`, `true`, `yes`, `on`); anything else is treated
+  as off.
+- `LOG_LEVEL` — defaults to `INFO`. Set to `DEBUG` for verbose logs or `WARNING`
+  to quiet the OAuth-completion line in production.
 
 OAuth `state` is signed and stored in a short-lived HttpOnly cookie scoped to the flow. No server-side state store is used; the signed cookie itself is the state — binding the OAuth callback to the user's browser and preventing cross-flow reuse.
 

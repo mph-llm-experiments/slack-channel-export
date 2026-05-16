@@ -46,7 +46,13 @@ gcloud run deploy slack-channel-export --source . --region us-west1
 
 ## Tests
 
-There are none yet. If/when adding tests, prefer in-process Flask test client + Slack response mocking via `slack_sdk`'s `RetryHandler` test patterns or just `responses`/`httpx-mock` for the HTTP layer.
+A `pytest` suite lives under `tests/`. It uses Flask's in-process test client and a `mock_web_client` fixture in `tests/conftest.py` that monkeypatches `slack_sdk.WebClient` so tests run offline. Run:
+
+```bash
+.venv/bin/pytest -q
+```
+
+Install dev deps with `pip install -r requirements-dev.txt`. If you add a new code path that touches OAuth, an in-memory store, the CSV writer, or any external HTTP, add or extend a test for it.
 
 ## When in doubt
 

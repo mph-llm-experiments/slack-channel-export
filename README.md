@@ -94,10 +94,14 @@ gcloud secrets create slack-client-id --replication-policy=automatic
 printf '%s' "$SLACK_CLIENT_ID" | gcloud secrets versions add slack-client-id --data-file=-
 gcloud secrets create slack-client-secret --replication-policy=automatic
 printf '%s' "$SLACK_CLIENT_SECRET" | gcloud secrets versions add slack-client-secret --data-file=-
+# APP_SECRET_KEY signs the OAuth state cookie — generate a fresh value with:
+#   python -c 'import secrets; print(secrets.token_urlsafe(32))'
+gcloud secrets create app-secret-key --replication-policy=automatic
+printf '%s' "$APP_SECRET_KEY" | gcloud secrets versions add app-secret-key --data-file=-
 
 PROJECT_NUMBER=$(gcloud projects describe mph-gcloud-cli --format='value(projectNumber)')
 RUNTIME_SA="${PROJECT_NUMBER}-compute@developer.gserviceaccount.com"
-for s in slack-client-id slack-client-secret; do
+for s in slack-client-id slack-client-secret app-secret-key; do
   gcloud secrets add-iam-policy-binding $s \
     --member="serviceAccount:${RUNTIME_SA}" \
     --role="roles/secretmanager.secretAccessor"
@@ -115,7 +119,7 @@ gcloud run deploy slack-channel-export \
   --memory 512Mi \
   --timeout 3600 \
   --allow-unauthenticated \
-  --set-secrets SLACK_CLIENT_ID=slack-client-id:latest,SLACK_CLIENT_SECRET=slack-client-secret:latest
+  --set-secrets SLACK_CLIENT_ID=slack-client-id:latest,SLACK_CLIENT_SECRET=slack-client-secret:latest,APP_SECRET_KEY=app-secret-key:latest
 ```
 
 (`--allow-unauthenticated` here means "no Cloud Run IAM auth required" — Cloud IAP is the real gate.)

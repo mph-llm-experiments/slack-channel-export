@@ -23,15 +23,10 @@ import slack_channel_export_selfservice_1 as app_module  # noqa: E402
 def app():
     app_module.app.config["TESTING"] = True
     yield app_module.app
-    # Reset module-level stores so state doesn't leak between tests. Both stores
-    # are plain dicts today and become EphemeralStore instances in Task 3 —
-    # this teardown works for both shapes.
+    # Reset module-level EphemeralStores so state doesn't leak between tests.
     for name in ("_pending_downloads", "_rejoin_sessions"):
         store = getattr(app_module, name, None)
-        if isinstance(store, dict):
-            store.clear()
-        elif store is not None and hasattr(store, "_items"):
-            # EphemeralStore: clear under its lock.
+        if store is not None and hasattr(store, "_items"):
             with store._lock:
                 store._items.clear()
 

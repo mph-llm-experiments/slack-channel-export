@@ -17,27 +17,27 @@ A small Flask app, deployed to a single-instance Google Cloud Run service in `us
 
 The user lands on `/` and authorizes Slack. The app fetches their channel list, builds a CSV plus a Markdown welcome-back checklist, DMs both files to them, and offers a one-shot browser download.
 
-![Export landing page](./screenshots/image_720.png)
+![Export landing page](./screenshots/export-landing.png)
 
-_Export landing page. (Earlier iteration of the copy — the current version is trimmer, talks only about leave/sabbatical, and doesn't mention DMs or group DMs.)_
+_Export landing page. The "Rejoin your channels →" link at the bottom points at the companion `/rejoin` flow for when they come back._
 
-![Export completion page](./screenshots/image_720-1.png)
+![Export completion page](./screenshots/export-complete.png)
 
-_Export completion. (Earlier iteration — back when the tool exported DMs and group DMs too and kept an IT copy on disk. Current builds export only public + private channels and persist nothing server-side.)_
+_Export completion. Public + private channels only — DMs and group DMs are intentionally out of scope. Nothing is persisted server-side; the user is the sole keeper of their files._
 
 ### Rejoin flow
 
 When the user comes back, they hit `/rejoin`, authorize Slack again with a narrower scope set, upload the CSV they saved before they left, and the app auto-joins every public channel from it.
 
-![Rejoin landing page](./screenshots/image_720-2.png)
+![Rejoin landing page](./screenshots/rejoin-landing.png)
 
 _Rejoin landing page. The smaller scope set (`channels:write` only) is shown on the Slack consent screen the user sees next._
 
-![Rejoin upload form](./screenshots/image_720-3.png)
+![Rejoin upload form](./screenshots/rejoin-upload.png)
 
 _Upload form after the OAuth callback. A short-lived session cookie (15 min) bridges OAuth → upload so the file POST has the user token waiting for it server-side._
 
-![Rejoin completion page](./screenshots/image_720-4.png)
+![Rejoin completion page](./screenshots/rejoin-complete.png)
 
 _Rejoin completion. Slack's `conversations.join` returns success with a `warning: already_in_channel` for channels you're already in — the app distinguishes that from a fresh join, so re-running the tool with the same CSV is safe and resumable._
 

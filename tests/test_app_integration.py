@@ -44,3 +44,23 @@ def test_slack_auth_sets_state_cookie(client):
     header = state_cookies[0]
     assert "HttpOnly" in header
     assert "SameSite=Lax" in header
+
+
+def test_max_content_length_is_set(app_mod):
+    assert app_mod.app.config["MAX_CONTENT_LENGTH"] is not None
+    assert app_mod.app.config["MAX_CONTENT_LENGTH"] <= 2 * 1024 * 1024
+
+
+def test_oversized_upload_rejected(client, app_mod):
+    import io
+    # Build a "session" so we don't 401 first.
+    sid = "test-sid-oversize"
+    app_mod._rejoin_sessions.put(sid, {"token": "xoxp-test", "user_id": "U"})
+    client.set_cookie(key="rejoin_sid", value=sid, domain="localhost")
+    big = b"a,b\n" + (b"x" * (2 * 1024 * 1024))
+    resp = client.post(
+        "/rejoin/upload",
+        data={"csv": (io.BytesIO(big), "big.csv")},
+        content_type="multipart/form-data",
+    )
+    assert resp.status_code in (400, 413)

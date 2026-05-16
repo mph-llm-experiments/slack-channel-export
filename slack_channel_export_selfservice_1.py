@@ -110,6 +110,9 @@ app = Flask(__name__)
 # configured redirect URIs.
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 app.secret_key = os.environ.get("APP_SECRET_KEY") or secrets.token_urlsafe(32)
+# Channel exports are small (a few KB) — 1 MB is generous and stops a casual
+# attacker from OOM'ing the worker via the rejoin upload endpoint.
+app.config["MAX_CONTENT_LENGTH"] = 1 * 1024 * 1024
 if not os.environ.get("APP_SECRET_KEY"):
     # Ephemeral key: fine for dev, but in-flight OAuth flows break on restart.
     # Production should set APP_SECRET_KEY explicitly.
@@ -190,6 +193,7 @@ _REJOIN_SESSION_TTL = 900  # 15 min — long enough to grab the CSV from Slack
 _rejoin_sessions: EphemeralStore = EphemeralStore(
     ttl_seconds=_REJOIN_SESSION_TTL, max_size=500
 )
+_MAX_REJOIN_ROWS = 5000  # generous: well above any realistic Slack workspace
 
 _CSV_DANGEROUS_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
 
@@ -798,10 +802,19 @@ def rejoin_upload():
         return render_template_string(REJOIN_UPLOAD_PAGE, error="That file isn't UTF-8 CSV."), 400
 
     reader = csv.DictReader(io.StringIO(text))
-    rows = list(reader)
+    rows: list[dict] = []
+    for row in reader:
+        if len(rows) >= _MAX_REJOIN_ROWS:
+            return render_template_string(
+                REJOIN_UPLOAD_PAGE,
+                error=f"CSV exceeds {_MAX_REJOIN_ROWS} rows. Trim and try again.",
+            ), 400
+        rows.append(row)
+
     public_rows = [
         r for r in rows
-        if r.get("type") == "Public Channel" and r.get("is_archived", "False") != "True"
+        if r.get("type") == "Public Channel"
+        and r.get("is_archived", "False") != "True"
     ]
 
     user_client = WebClient(token=session["token"])

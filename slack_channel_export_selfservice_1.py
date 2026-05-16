@@ -716,5 +716,7 @@ if __name__ == "__main__":
     if not CLIENT_ID or not CLIENT_SECRET:
         print("Set SLACK_CLIENT_ID and SLACK_CLIENT_SECRET", file=sys.stderr)
         sys.exit(1)
-    print(f"Running at http://localhost:5001")
-    app.run(port=5001, debug=True)
+    debug = os.environ.get("FLASK_DEBUG", "0").strip().lower() in ("1", "true", "yes", "on")
+    port = int(os.environ.get("PORT", "5001"))
+    print(f"Running at http://localhost:{port} (debug={debug})")
+    app.run(host="127.0.0.1", port=port, debug=debug)

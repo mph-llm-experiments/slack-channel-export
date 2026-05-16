@@ -64,3 +64,22 @@ def test_oversized_upload_rejected(client, app_mod):
         content_type="multipart/form-data",
     )
     assert resp.status_code in (400, 413)
+
+
+def test_callback_rejects_missing_scope(client, app_mod, mock_web_client):
+    # Set up a valid state cookie for the export flow.
+    with app_mod.app.app_context():
+        nonce, cookie = app_mod.issue_oauth_state("export")
+    client.set_cookie("oauth_state", cookie, domain="localhost")
+
+    # Slack returns only a subset of the requested scopes.
+    mock_web_client.oauth_v2_access.return_value = {
+        "authed_user": {
+            "access_token": "xoxp-test",
+            "id": "U123",
+            "scope": "channels:read",  # missing the others
+        }
+    }
+    resp = client.get(f"/slack/callback?code=abc&state={nonce}")
+    assert resp.status_code == 400
+    assert b"Missing required scopes" in resp.data

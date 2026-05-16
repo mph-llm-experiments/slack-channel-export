@@ -176,6 +176,16 @@ def _error_response_clearing_state(message: str, status: int):
     return resp
 
 
+def _missing_scopes(oauth_resp: dict, required: list[str]) -> list[str]:
+    """Return required scopes Slack did NOT grant. Empty list means OK."""
+    granted = {
+        s.strip()
+        for s in oauth_resp.get("authed_user", {}).get("scope", "").split(",")
+        if s.strip()
+    }
+    return sorted(set(required) - granted)
+
+
 CLIENT_ID = os.environ.get("SLACK_CLIENT_ID", "")
 CLIENT_SECRET = os.environ.get("SLACK_CLIENT_SECRET", "")
 
@@ -549,6 +559,12 @@ def slack_callback():
             f"OAuth error: {e.response['error']}", 500
         )
 
+    missing = _missing_scopes(oauth_resp, USER_SCOPES)
+    if missing:
+        return _error_response_clearing_state(
+            f"Missing required scopes: {', '.join(missing)}.", 400
+        )
+
     user_token = oauth_resp.get("authed_user", {}).get("access_token")
     user_id = oauth_resp.get("authed_user", {}).get("id")
     granted_scopes = oauth_resp.get("authed_user", {}).get("scope", "")
@@ -748,6 +764,12 @@ def rejoin_callback():
     except SlackApiError as e:
         return _error_response_clearing_state(
             f"OAuth error: {e.response['error']}", 500
+        )
+
+    missing = _missing_scopes(oauth_resp, REJOIN_SCOPES)
+    if missing:
+        return _error_response_clearing_state(
+            f"Missing required scopes: {', '.join(missing)}.", 400
         )
 
     user_token = oauth_resp.get("authed_user", {}).get("access_token")

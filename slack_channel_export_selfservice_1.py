@@ -36,6 +36,7 @@ Usage:
 
 import csv
 import io
+import logging
 import os
 import secrets
 import sys
@@ -50,6 +51,14 @@ from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 from slack_sdk.oauth import AuthorizeUrlGenerator
 from werkzeug.middleware.proxy_fix import ProxyFix
+
+
+logger = logging.getLogger("slack_channel_export")
+if not logging.getLogger().handlers:
+    logging.basicConfig(
+        level=os.environ.get("LOG_LEVEL", "INFO"),
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
 
 
 class EphemeralStore:
@@ -116,10 +125,7 @@ app.config["MAX_CONTENT_LENGTH"] = 1 * 1024 * 1024
 if not os.environ.get("APP_SECRET_KEY"):
     # Ephemeral key: fine for dev, but in-flight OAuth flows break on restart.
     # Production should set APP_SECRET_KEY explicitly.
-    print(
-        "[warn] APP_SECRET_KEY not set; using an ephemeral key",
-        file=sys.stderr,
-    )
+    logger.warning("APP_SECRET_KEY not set; using an ephemeral key")
 
 _OAUTH_STATE_TTL = 300
 _OAUTH_STATE_COOKIE = "oauth_state"
@@ -568,7 +574,9 @@ def slack_callback():
     user_token = oauth_resp.get("authed_user", {}).get("access_token")
     user_id = oauth_resp.get("authed_user", {}).get("id")
     granted_scopes = oauth_resp.get("authed_user", {}).get("scope", "")
-    print(f"[oauth] user={user_id} granted_scopes={granted_scopes}", flush=True)
+    logger.info(
+        "oauth completed user_id=%s granted_scopes=%s", user_id, granted_scopes
+    )
 
     if not user_token:
         return _error_response_clearing_state("No user token received.", 500)
@@ -579,7 +587,11 @@ def slack_callback():
     try:
         user_info = user_client.users_info(user=user_id)
         user_name = user_info["user"]["profile"].get("real_name", user_id)
-    except SlackApiError:
+    except SlackApiError as e:
+        logger.info(
+            "users_info failed, falling back to user_id: %s",
+            e.response.get("error", "unknown") if hasattr(e, "response") else "unknown",
+        )
         user_name = user_id
 
     # Fetch all channels (public + private only — DMs/group DMs are out of scope)
@@ -668,13 +680,16 @@ def slack_callback():
         dm_status = "sent"
     except SlackApiError as e:
         dm_status = f"failed: {e.response['error']}"
-        print(f"[upload] failed: {e.response.data}", flush=True)
+        logger.warning("slack file upload failed: %s", e.response.get("error", "unknown"))
 
     # Revoke the user token immediately — we don't need it anymore
     try:
         user_client.auth_revoke()
-    except SlackApiError:
-        pass  # best effort
+    except SlackApiError as e:
+        logger.warning(
+            "auth_revoke failed (export flow): %s",
+            e.response.get("error", "unknown") if hasattr(e, "response") else "unknown",
+        )
 
     # Stash CSV in memory for a single browser download. Token is opaque; the
     # entry is popped on first GET, and the store TTL-evicts orphaned entries.
@@ -870,8 +885,11 @@ def rejoin_upload():
     # Best-effort token revoke + session cleanup
     try:
         user_client.auth_revoke()
-    except SlackApiError:
-        pass
+    except SlackApiError as e:
+        logger.warning(
+            "auth_revoke failed (rejoin flow): %s",
+            e.response.get("error", "unknown") if hasattr(e, "response") else "unknown",
+        )
     _rejoin_sessions.discard(sid)
 
     html = render_template_string(
@@ -894,5 +912,5 @@ if __name__ == "__main__":
         sys.exit(1)
     debug = os.environ.get("FLASK_DEBUG", "0").strip().lower() in ("1", "true", "yes", "on")
     port = int(os.environ.get("PORT", "5001"))
-    print(f"Running at http://localhost:{port} (debug={debug})")
+    logger.info("Running at http://localhost:%d (debug=%s)", port, debug)
     app.run(host="127.0.0.1", port=port, debug=debug)

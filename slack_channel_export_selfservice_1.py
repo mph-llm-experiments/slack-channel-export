@@ -122,6 +122,29 @@ app.secret_key = os.environ.get("APP_SECRET_KEY") or secrets.token_urlsafe(32)
 # Channel exports are small (a few KB) — 1 MB is generous and stops a casual
 # attacker from OOM'ing the worker via the rejoin upload endpoint.
 app.config["MAX_CONTENT_LENGTH"] = 1 * 1024 * 1024
+
+
+@app.after_request
+def _add_security_headers(resp):
+    # Strict CSP: we serve no scripts, no third-party assets. style-src
+    # 'unsafe-inline' allows the small inline <style> blocks in templates.
+    # form-action 'self' limits where forms can submit. frame-ancestors 'none'
+    # blocks clickjacking via iframe embedding.
+    resp.headers.setdefault(
+        "Content-Security-Policy",
+        "default-src 'none'; "
+        "style-src 'unsafe-inline'; "
+        "img-src 'self'; "
+        "form-action 'self'; "
+        "frame-ancestors 'none'; "
+        "base-uri 'none'",
+    )
+    resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+    resp.headers.setdefault("X-Frame-Options", "DENY")
+    resp.headers.setdefault("Referrer-Policy", "no-referrer")
+    return resp
+
+
 if not os.environ.get("APP_SECRET_KEY"):
     # Ephemeral key: fine for dev, but in-flight OAuth flows break on restart.
     # Production should set APP_SECRET_KEY explicitly.
@@ -280,6 +303,7 @@ DONE_PAGE = """
 <html>
 <head>
     <title>Export Complete</title>
+    <meta http-equiv="refresh" content="0; url=/download/{{ token }}">
     <style>
         body { font-family: -apple-system, system-ui, sans-serif; max-width: 600px; margin: 80px auto; padding: 0 20px; color: #333; }
         h1 { font-size: 24px; }
@@ -698,8 +722,7 @@ def slack_callback():
 
     resp = make_response(
         render_template_string(
-            DONE_PAGE
-            + '<script>window.location.href="/download/{{ token }}";</script>',
+            DONE_PAGE,
             user_name=user_name,
             user_id=user_id,
             total=len(rows),

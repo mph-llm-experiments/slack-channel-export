@@ -83,3 +83,19 @@ def test_callback_rejects_missing_scope(client, app_mod, mock_web_client):
     resp = client.get(f"/slack/callback?code=abc&state={nonce}")
     assert resp.status_code == 400
     assert b"Missing required scopes" in resp.data
+
+
+def test_security_headers_on_landing(client):
+    resp = client.get("/")
+    assert resp.headers.get("X-Content-Type-Options") == "nosniff"
+    assert resp.headers.get("X-Frame-Options") == "DENY"
+    assert resp.headers.get("Referrer-Policy") == "no-referrer"
+    csp = resp.headers.get("Content-Security-Policy", "")
+    assert "default-src 'none'" in csp
+    assert "frame-ancestors 'none'" in csp
+
+
+def test_done_page_uses_meta_refresh_not_inline_script(app_mod):
+    # The auto-redirect must not rely on inline script — CSP forbids it.
+    assert "<script>" not in app_mod.DONE_PAGE
+    assert 'http-equiv="refresh"' in app_mod.DONE_PAGE

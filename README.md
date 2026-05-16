@@ -11,6 +11,36 @@ Nothing is persisted server-side. The user is the sole keeper of their export.
 
 A small Flask app, deployed to a single-instance Google Cloud Run service in `us-west1`. End-user access is gated by Cloud IAP restricted to the `puddingtime.net` Google Workspace. The Slack side is a single OAuth app (User Token Scopes only — no bot) named **ChannelListerator**. Two OAuth flows, two redirect URLs, two distinct scope sets — see [ARCHITECTURE.md](./ARCHITECTURE.md).
 
+## Screenshots
+
+### Export flow
+
+The user lands on `/` and authorizes Slack. The app fetches their channel list, builds a CSV plus a Markdown welcome-back checklist, DMs both files to them, and offers a one-shot browser download.
+
+![Export landing page](./screenshots/image_720.png)
+
+_Export landing page. (Earlier iteration of the copy — the current version is trimmer, talks only about leave/sabbatical, and doesn't mention DMs or group DMs.)_
+
+![Export completion page](./screenshots/image_720-1.png)
+
+_Export completion. (Earlier iteration — back when the tool exported DMs and group DMs too and kept an IT copy on disk. Current builds export only public + private channels and persist nothing server-side.)_
+
+### Rejoin flow
+
+When the user comes back, they hit `/rejoin`, authorize Slack again with a narrower scope set, upload the CSV they saved before they left, and the app auto-joins every public channel from it.
+
+![Rejoin landing page](./screenshots/image_720-2.png)
+
+_Rejoin landing page. The smaller scope set (`channels:write` only) is shown on the Slack consent screen the user sees next._
+
+![Rejoin upload form](./screenshots/image_720-3.png)
+
+_Upload form after the OAuth callback. A short-lived session cookie (15 min) bridges OAuth → upload so the file POST has the user token waiting for it server-side._
+
+![Rejoin completion page](./screenshots/image_720-4.png)
+
+_Rejoin completion. Slack's `conversations.join` returns success with a `warning: already_in_channel` for channels you're already in — the app distinguishes that from a fresh join, so re-running the tool with the same CSV is safe and resumable._
+
 ## Routes
 
 | Path | What it does |

@@ -129,6 +129,19 @@ gcloud beta iap web add-iam-policy-binding \
   --member=domain:puddingtime.net --role=roles/iap.httpsResourceAccessor
 ```
 
+## Environment variables
+
+- `SLACK_CLIENT_ID` / `SLACK_CLIENT_SECRET` — required. Copy from your Slack app's Basic Information page.
+- `APP_SECRET_KEY` — required in production. Signs the short-lived OAuth `state`
+  cookie that binds the OAuth callback to the user's browser. Generate one with:
+  `python -c 'import secrets; print(secrets.token_urlsafe(32))'`. If unset, an
+  ephemeral key is generated and a warning is logged; restarts strand in-flight
+  OAuth handshakes.
+- `APP_ALLOW_INSECURE_COOKIES=1` — local-dev only. Without this, cookies are
+  always set with the `Secure` flag. Do not set in production.
+
+OAuth `state` is signed and stored in a short-lived HttpOnly cookie scoped to the flow. No server-side state store is used; the signed cookie itself is the state — binding the OAuth callback to the user's browser and preventing cross-flow reuse.
+
 ## Local dev
 
 ```bash
@@ -136,6 +149,8 @@ python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 export SLACK_CLIENT_ID=...
 export SLACK_CLIENT_SECRET=...
+export APP_SECRET_KEY=...          # or omit for ephemeral key (dev only)
+export APP_ALLOW_INSECURE_COOKIES=1  # required for http://localhost
 .venv/bin/python slack_channel_export_selfservice_1.py
 # http://localhost:5001
 ```

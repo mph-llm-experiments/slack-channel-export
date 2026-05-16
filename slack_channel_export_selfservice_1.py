@@ -41,41 +41,15 @@ import secrets
 import sys
 import threading
 import time
-import uuid
 from collections import Counter
 from datetime import datetime
 
 from flask import Flask, make_response, redirect, request, send_file, render_template_string, url_for
+from itsdangerous import BadData, URLSafeTimedSerializer
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 from slack_sdk.oauth import AuthorizeUrlGenerator
 from werkzeug.middleware.proxy_fix import ProxyFix
-
-
-class InMemoryOAuthStateStore:
-    """Process-local OAuth state store with TTL. Replaces FileOAuthStateStore
-    so the app has no filesystem dependency — fine for single-instance Cloud Run.
-    """
-
-    def __init__(self, expiration_seconds: int = 300):
-        self.expiration_seconds = expiration_seconds
-        self._states: dict[str, float] = {}
-        self._lock = threading.Lock()
-
-    def issue(self) -> str:
-        state = str(uuid.uuid4())
-        now = time.time()
-        with self._lock:
-            self._states[state] = now + self.expiration_seconds
-            # Opportunistic cleanup of expired entries.
-            for k in [k for k, exp in self._states.items() if exp < now]:
-                self._states.pop(k, None)
-        return state
-
-    def consume(self, state: str) -> bool:
-        with self._lock:
-            exp = self._states.pop(state, None)
-        return exp is not None and exp >= time.time()
 
 
 class EphemeralStore:
@@ -135,6 +109,69 @@ app = Flask(__name__)
 # url_for(..., _external=True) returns https:// URLs that match the Slack app's
 # configured redirect URIs.
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
+app.secret_key = os.environ.get("APP_SECRET_KEY") or secrets.token_urlsafe(32)
+if not os.environ.get("APP_SECRET_KEY"):
+    # Ephemeral key: fine for dev, but in-flight OAuth flows break on restart.
+    # Production should set APP_SECRET_KEY explicitly.
+    print(
+        "[warn] APP_SECRET_KEY not set; using an ephemeral key",
+        file=sys.stderr,
+    )
+
+_OAUTH_STATE_TTL = 300
+_OAUTH_STATE_COOKIE = "oauth_state"
+_OAUTH_STATE_SALT = "oauth-state-v1"
+
+
+def _state_serializer() -> URLSafeTimedSerializer:
+    return URLSafeTimedSerializer(app.secret_key, salt=_OAUTH_STATE_SALT)
+
+
+def issue_oauth_state(flow: str) -> tuple[str, str]:
+    """Mint a (nonce, signed_cookie_value) pair for an outgoing OAuth redirect.
+
+    The nonce goes in the Slack ``state`` query parameter; the signed cookie
+    binds the flow to the user's browser. Both must match on callback.
+    """
+    nonce = secrets.token_urlsafe(24)
+    signed = _state_serializer().dumps({"nonce": nonce, "flow": flow})
+    return nonce, signed
+
+
+def consume_oauth_state(
+    flow: str, query_state: str | None, signed_cookie: str | None
+) -> bool:
+    """Return True iff the cookie's signature is valid, fresh, bound to ``flow``,
+    and its embedded nonce matches the query_state."""
+    if not query_state or not signed_cookie:
+        return False
+    try:
+        payload = _state_serializer().loads(
+            signed_cookie, max_age=_OAUTH_STATE_TTL
+        )
+    except BadData:
+        return False
+    return (
+        isinstance(payload, dict)
+        and payload.get("flow") == flow
+        and payload.get("nonce") == query_state
+    )
+
+
+def _cookie_secure() -> bool:
+    """Cookies should always be Secure in prod. Operator opts in to plain HTTP
+    only for local dev via APP_ALLOW_INSECURE_COOKIES=1."""
+    return os.environ.get("APP_ALLOW_INSECURE_COOKIES") != "1"
+
+
+def _error_response_clearing_state(message: str, status: int):
+    """Render ERROR_PAGE and clear the oauth_state cookie. Use on any failure
+    path after consume_oauth_state has succeeded — the cookie has been logically
+    consumed and shouldn't linger in the browser."""
+    resp = make_response(render_template_string(ERROR_PAGE, error=message), status)
+    resp.delete_cookie(_OAUTH_STATE_COOKIE)
+    return resp
+
 
 CLIENT_ID = os.environ.get("SLACK_CLIENT_ID", "")
 CLIENT_SECRET = os.environ.get("SLACK_CLIENT_SECRET", "")
@@ -165,8 +202,6 @@ USER_SCOPES = [
 REJOIN_SCOPES = [
     "channels:write",
 ]
-
-state_store = InMemoryOAuthStateStore(expiration_seconds=300)
 
 LANDING_PAGE = """
 <!DOCTYPE html>
@@ -449,14 +484,22 @@ def _absolute_url(endpoint: str) -> str:
 
 @app.route("/slack/auth")
 def slack_auth():
-    state = state_store.issue()
+    nonce, signed = issue_oauth_state("export")
     generator = AuthorizeUrlGenerator(
         client_id=CLIENT_ID,
         user_scopes=USER_SCOPES,
         redirect_uri=_absolute_url("slack_callback"),
     )
-    url = generator.generate(state=state)
-    return redirect(url)
+    resp = redirect(generator.generate(state=nonce))
+    resp.set_cookie(
+        _OAUTH_STATE_COOKIE,
+        signed,
+        max_age=_OAUTH_STATE_TTL,
+        httponly=True,
+        secure=_cookie_secure(),
+        samesite="Lax",
+    )
+    return resp
 
 
 @app.route("/slack/callback")
@@ -468,8 +511,11 @@ def slack_callback():
     if error:
         return render_template_string(ERROR_PAGE, error=f"Slack authorization failed: {error}"), 400
 
-    if not state_store.consume(state):
-        return render_template_string(ERROR_PAGE, error="Invalid or expired state. Please try again."), 400
+    signed_state = request.cookies.get(_OAUTH_STATE_COOKIE)
+    if not consume_oauth_state("export", state, signed_state):
+        return _error_response_clearing_state(
+            "Invalid or expired state. Please try again.", 400
+        )
 
     # Exchange code for user token
     client = WebClient()
@@ -481,7 +527,9 @@ def slack_callback():
             redirect_uri=_absolute_url("slack_callback"),
         )
     except SlackApiError as e:
-        return render_template_string(ERROR_PAGE, error=f"OAuth error: {e.response['error']}"), 500
+        return _error_response_clearing_state(
+            f"OAuth error: {e.response['error']}", 500
+        )
 
     user_token = oauth_resp.get("authed_user", {}).get("access_token")
     user_id = oauth_resp.get("authed_user", {}).get("id")
@@ -489,7 +537,7 @@ def slack_callback():
     print(f"[oauth] user={user_id} granted_scopes={granted_scopes}", flush=True)
 
     if not user_token:
-        return render_template_string(ERROR_PAGE, error="No user token received."), 500
+        return _error_response_clearing_state("No user token received.", 500)
 
     user_client = WebClient(token=user_token)
 
@@ -511,7 +559,9 @@ def slack_callback():
                 cursor=cursor,
             )
         except SlackApiError as e:
-            return render_template_string(ERROR_PAGE, error=f"API error: {e.response['error']}"), 500
+            return _error_response_clearing_state(
+                f"API error: {e.response['error']}", 500
+            )
 
         channels.extend(resp["channels"])
         cursor = resp.get("response_metadata", {}).get("next_cursor")
@@ -591,16 +641,20 @@ def slack_callback():
     token = secrets.token_urlsafe(16)
     _pending_downloads.put(token, (csv_bytes, csv_filename))
 
-    return render_template_string(
-        DONE_PAGE
-        + '<script>window.location.href="/download/{{ token }}";</script>',
-        user_name=user_name,
-        user_id=user_id,
-        total=len(rows),
-        counts=counts,
-        token=token,
-        dm_status=dm_status,
+    resp = make_response(
+        render_template_string(
+            DONE_PAGE
+            + '<script>window.location.href="/download/{{ token }}";</script>',
+            user_name=user_name,
+            user_id=user_id,
+            total=len(rows),
+            counts=counts,
+            token=token,
+            dm_status=dm_status,
+        )
     )
+    resp.delete_cookie(_OAUTH_STATE_COOKIE)
+    return resp
 
 
 @app.route("/download/<token>")
@@ -627,13 +681,22 @@ def rejoin_index():
 
 @app.route("/rejoin/auth")
 def rejoin_auth():
-    state = state_store.issue()
+    nonce, signed = issue_oauth_state("rejoin")
     generator = AuthorizeUrlGenerator(
         client_id=CLIENT_ID,
         user_scopes=REJOIN_SCOPES,
         redirect_uri=_absolute_url("rejoin_callback"),
     )
-    return redirect(generator.generate(state=state))
+    resp = redirect(generator.generate(state=nonce))
+    resp.set_cookie(
+        _OAUTH_STATE_COOKIE,
+        signed,
+        max_age=_OAUTH_STATE_TTL,
+        httponly=True,
+        secure=_cookie_secure(),
+        samesite="Lax",
+    )
+    return resp
 
 
 @app.route("/slack/rejoin_callback")
@@ -644,8 +707,11 @@ def rejoin_callback():
 
     if error:
         return render_template_string(ERROR_PAGE, error=f"Slack authorization failed: {error}"), 400
-    if not state_store.consume(state):
-        return render_template_string(ERROR_PAGE, error="Invalid or expired state. Please try again."), 400
+    signed_state = request.cookies.get(_OAUTH_STATE_COOKIE)
+    if not consume_oauth_state("rejoin", state, signed_state):
+        return _error_response_clearing_state(
+            "Invalid or expired state. Please try again.", 400
+        )
 
     client = WebClient()
     try:
@@ -656,12 +722,14 @@ def rejoin_callback():
             redirect_uri=_absolute_url("rejoin_callback"),
         )
     except SlackApiError as e:
-        return render_template_string(ERROR_PAGE, error=f"OAuth error: {e.response['error']}"), 500
+        return _error_response_clearing_state(
+            f"OAuth error: {e.response['error']}", 500
+        )
 
     user_token = oauth_resp.get("authed_user", {}).get("access_token")
     user_id = oauth_resp.get("authed_user", {}).get("id")
     if not user_token:
-        return render_template_string(ERROR_PAGE, error="No user token received."), 500
+        return _error_response_clearing_state("No user token received.", 500)
 
     sid = secrets.token_urlsafe(24)
     _rejoin_sessions.put(sid, {"token": user_token, "user_id": user_id})
@@ -671,9 +739,10 @@ def rejoin_callback():
         sid,
         max_age=_REJOIN_SESSION_TTL,
         httponly=True,
-        secure=request.is_secure,
+        secure=_cookie_secure(),
         samesite="Lax",
     )
+    resp.delete_cookie(_OAUTH_STATE_COOKIE)
     return resp
 
 

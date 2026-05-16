@@ -17,3 +17,30 @@ def test_pending_downloads_is_capped(app_mod):
 def test_rejoin_sessions_is_capped(app_mod):
     from slack_channel_export_selfservice_1 import EphemeralStore
     assert isinstance(app_mod._rejoin_sessions, EphemeralStore)
+
+
+def test_callback_rejects_without_state_cookie(client):
+    resp = client.get("/slack/callback?code=fake&state=fake")
+    assert resp.status_code == 400
+    assert b"Invalid or expired state" in resp.data
+
+
+def test_rejoin_callback_rejects_state_from_export_flow(client, app_mod):
+    # Mint an export-flow cookie and try to use it at the rejoin callback.
+    with app_mod.app.app_context():
+        nonce, cookie = app_mod.issue_oauth_state("export")
+    client.set_cookie("oauth_state", cookie, domain="localhost")
+    resp = client.get(f"/slack/rejoin_callback?code=x&state={nonce}")
+    assert resp.status_code == 400
+    assert b"Invalid or expired state" in resp.data
+
+
+def test_slack_auth_sets_state_cookie(client):
+    resp = client.get("/slack/auth", follow_redirects=False)
+    assert resp.status_code == 302
+    cookies = resp.headers.getlist("Set-Cookie")
+    state_cookies = [c for c in cookies if c.startswith("oauth_state=")]
+    assert len(state_cookies) == 1, f"expected one oauth_state cookie, got {cookies!r}"
+    header = state_cookies[0]
+    assert "HttpOnly" in header
+    assert "SameSite=Lax" in header

@@ -77,6 +77,59 @@ class InMemoryOAuthStateStore:
             exp = self._states.pop(state, None)
         return exp is not None and exp >= time.time()
 
+
+class EphemeralStore:
+    """Thread-safe in-memory store with per-entry TTL and a hard size cap.
+
+    Holds short-lived per-request artifacts (CSV download payloads, rejoin
+    session tokens) without unbounded memory growth. Lazy sweep on every op
+    so a quiet period followed by a burst still self-cleans.
+    """
+
+    def __init__(self, ttl_seconds: float, max_size: int = 1000):
+        self._ttl = ttl_seconds
+        self._max_size = max_size
+        self._items: dict[str, tuple[float, object]] = {}
+        self._lock = threading.Lock()
+
+    def put(self, key: str, value: object) -> None:
+        now = time.monotonic()
+        with self._lock:
+            self._sweep_locked(now)
+            if (
+                len(self._items) >= self._max_size
+                and key not in self._items
+            ):
+                # O(n) scan to find the oldest entry; acceptable at max_size <= 1000.
+                oldest_key = min(self._items, key=lambda k: self._items[k][0])
+                del self._items[oldest_key]
+            self._items[key] = (now + self._ttl, value)
+
+    def pop(self, key: str) -> object | None:
+        with self._lock:
+            self._sweep_locked(time.monotonic())
+            entry = self._items.pop(key, None)
+        return entry[1] if entry is not None else None
+
+    def peek(self, key: str) -> object | None:
+        with self._lock:
+            self._sweep_locked(time.monotonic())
+            entry = self._items.get(key)
+        return entry[1] if entry is not None else None
+
+    def discard(self, key: str) -> None:
+        with self._lock:
+            self._items.pop(key, None)
+
+    def _sweep_locked(self, now: float) -> None:
+        """Drop every entry whose TTL has passed. After this returns, every
+        remaining entry has `exp >= now`, so callers can read without further
+        staleness checks."""
+        expired = [k for k, (exp, _) in self._items.items() if exp < now]
+        for k in expired:
+            del self._items[k]
+
+
 app = Flask(__name__)
 # Cloud Run / IAP terminate TLS upstream; trust their X-Forwarded-* headers so
 # url_for(..., _external=True) returns https:// URLs that match the Slack app's

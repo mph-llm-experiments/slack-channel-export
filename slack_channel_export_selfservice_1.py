@@ -139,16 +139,20 @@ app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 CLIENT_ID = os.environ.get("SLACK_CLIENT_ID", "")
 CLIENT_SECRET = os.environ.get("SLACK_CLIENT_SECRET", "")
 
-# One-shot in-memory stash for the browser download: { token: (csv_bytes, filename) }.
-# The CSV is also delivered via Slack DM; this dict just keeps the "Download Again"
-# link working for a single fetch in the same session.
-_pending_downloads: dict[str, tuple[bytes, str]] = {}
+# One-shot in-memory stash for the browser download. CSV is also delivered via
+# Slack DM; this just keeps the "Download Again" link working for a single fetch.
+# Capped + TTL'd so an abandoned auto-redirect doesn't pin CSV bytes in memory
+# indefinitely.
+_pending_downloads: EphemeralStore = EphemeralStore(ttl_seconds=300, max_size=500)
 
 # Short-lived session for the /rejoin flow, bridging OAuth callback → file
-# upload. Keyed by an opaque cookie; value holds the Slack user token.
-_rejoin_sessions: dict[str, dict] = {}
+# upload. Capped + TTL'd so orphaned auths don't hold channels:write tokens
+# in memory forever.
 _REJOIN_SESSION_COOKIE = "rejoin_sid"
 _REJOIN_SESSION_TTL = 900  # 15 min — long enough to grab the CSV from Slack
+_rejoin_sessions: EphemeralStore = EphemeralStore(
+    ttl_seconds=_REJOIN_SESSION_TTL, max_size=500
+)
 
 USER_SCOPES = [
     "channels:read",
@@ -582,10 +586,10 @@ def slack_callback():
     except SlackApiError:
         pass  # best effort
 
-    # Stash CSV in memory for a single browser download. The token is opaque
-    # and the entry is popped on first GET.
+    # Stash CSV in memory for a single browser download. Token is opaque; the
+    # entry is popped on first GET, and the store TTL-evicts orphaned entries.
     token = secrets.token_urlsafe(16)
-    _pending_downloads[token] = (csv_bytes, csv_filename)
+    _pending_downloads.put(token, (csv_bytes, csv_filename))
 
     return render_template_string(
         DONE_PAGE
@@ -601,7 +605,7 @@ def slack_callback():
 
 @app.route("/download/<token>")
 def download(token):
-    entry = _pending_downloads.pop(token, None)
+    entry = _pending_downloads.pop(token)
     if entry is None:
         return render_template_string(
             ERROR_PAGE,
@@ -660,11 +664,7 @@ def rejoin_callback():
         return render_template_string(ERROR_PAGE, error="No user token received."), 500
 
     sid = secrets.token_urlsafe(24)
-    _rejoin_sessions[sid] = {
-        "token": user_token,
-        "user_id": user_id,
-        "expires_at": time.time() + _REJOIN_SESSION_TTL,
-    }
+    _rejoin_sessions.put(sid, {"token": user_token, "user_id": user_id})
     resp = redirect(url_for("rejoin_upload"))
     resp.set_cookie(
         _REJOIN_SESSION_COOKIE,
@@ -681,9 +681,8 @@ def _get_rejoin_session() -> tuple[str | None, dict | None]:
     sid = request.cookies.get(_REJOIN_SESSION_COOKIE)
     if not sid:
         return None, None
-    session = _rejoin_sessions.get(sid)
-    if not session or session["expires_at"] < time.time():
-        _rejoin_sessions.pop(sid, None)
+    session = _rejoin_sessions.peek(sid)
+    if session is None:
         return None, None
     return sid, session
 
@@ -749,7 +748,7 @@ def rejoin_upload():
         user_client.auth_revoke()
     except SlackApiError:
         pass
-    _rejoin_sessions.pop(sid, None)
+    _rejoin_sessions.discard(sid)
 
     html = render_template_string(
         REJOIN_DONE_PAGE,

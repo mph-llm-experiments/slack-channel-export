@@ -1,0 +1,7 @@
+.venv
+.git
+__pycache__
+*.pyc
+slack_states
+exports
+.DS_Store

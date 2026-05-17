@@ -35,67 +35,236 @@ Usage:
 """
 
 import csv
+import hmac
 import io
+import logging
 import os
 import secrets
 import sys
 import threading
 import time
-import uuid
 from collections import Counter
 from datetime import datetime
 
 from flask import Flask, make_response, redirect, request, send_file, render_template_string, url_for
+from itsdangerous import BadData, URLSafeTimedSerializer
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 from slack_sdk.oauth import AuthorizeUrlGenerator
 from werkzeug.middleware.proxy_fix import ProxyFix
 
 
-class InMemoryOAuthStateStore:
-    """Process-local OAuth state store with TTL. Replaces FileOAuthStateStore
-    so the app has no filesystem dependency — fine for single-instance Cloud Run.
+logger = logging.getLogger("slack_channel_export")
+if not logging.getLogger().handlers:
+    logging.basicConfig(
+        level=os.environ.get("LOG_LEVEL", "INFO"),
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
+
+
+class EphemeralStore:
+    """Thread-safe in-memory store with per-entry TTL and a hard size cap.
+
+    Holds short-lived per-request artifacts (CSV download payloads, rejoin
+    session tokens) without unbounded memory growth. Lazy sweep on every op
+    so a quiet period followed by a burst still self-cleans.
     """
 
-    def __init__(self, expiration_seconds: int = 300):
-        self.expiration_seconds = expiration_seconds
-        self._states: dict[str, float] = {}
+    def __init__(self, ttl_seconds: float, max_size: int = 1000):
+        self._ttl = ttl_seconds
+        self._max_size = max_size
+        self._items: dict[str, tuple[float, object]] = {}
         self._lock = threading.Lock()
 
-    def issue(self) -> str:
-        state = str(uuid.uuid4())
-        now = time.time()
+    def put(self, key: str, value: object) -> None:
+        now = time.monotonic()
         with self._lock:
-            self._states[state] = now + self.expiration_seconds
-            # Opportunistic cleanup of expired entries.
-            for k in [k for k, exp in self._states.items() if exp < now]:
-                self._states.pop(k, None)
-        return state
+            self._sweep_locked(now)
+            if (
+                len(self._items) >= self._max_size
+                and key not in self._items
+            ):
+                # O(n) scan to find the oldest entry; acceptable at max_size <= 1000.
+                oldest_key = min(self._items, key=lambda k: self._items[k][0])
+                del self._items[oldest_key]
+            self._items[key] = (now + self._ttl, value)
 
-    def consume(self, state: str) -> bool:
+    def pop(self, key: str) -> object | None:
         with self._lock:
-            exp = self._states.pop(state, None)
-        return exp is not None and exp >= time.time()
+            self._sweep_locked(time.monotonic())
+            entry = self._items.pop(key, None)
+        return entry[1] if entry is not None else None
+
+    def peek(self, key: str) -> object | None:
+        with self._lock:
+            self._sweep_locked(time.monotonic())
+            entry = self._items.get(key)
+        return entry[1] if entry is not None else None
+
+    def discard(self, key: str) -> None:
+        with self._lock:
+            self._items.pop(key, None)
+
+    def _sweep_locked(self, now: float) -> None:
+        """Drop every entry whose TTL has passed. After this returns, every
+        remaining entry has `exp >= now`, so callers can read without further
+        staleness checks."""
+        expired = [k for k, (exp, _) in self._items.items() if exp < now]
+        for k in expired:
+            del self._items[k]
+
 
 app = Flask(__name__)
 # Cloud Run / IAP terminate TLS upstream; trust their X-Forwarded-* headers so
 # url_for(..., _external=True) returns https:// URLs that match the Slack app's
 # configured redirect URIs.
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
+_app_secret_key_env = os.environ.get("APP_SECRET_KEY")
+if not _app_secret_key_env:
+    _flask_debug = os.environ.get("FLASK_DEBUG", "0").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+    if not _flask_debug:
+        logger.error(
+            "APP_SECRET_KEY is required in production; set FLASK_DEBUG=1 for a "
+            "local-dev ephemeral fallback."
+        )
+        sys.exit(1)
+    logger.warning("APP_SECRET_KEY not set; using an ephemeral key (dev only)")
+app.secret_key = _app_secret_key_env or secrets.token_urlsafe(32)
+# Channel exports are small (a few KB) — 1 MB is generous and stops a casual
+# attacker from OOM'ing the worker via the rejoin upload endpoint.
+app.config["MAX_CONTENT_LENGTH"] = 1 * 1024 * 1024
+
+
+@app.after_request
+def _add_security_headers(resp):
+    # Strict CSP: we serve no scripts, no third-party assets. style-src
+    # 'unsafe-inline' allows the small inline <style> blocks in templates.
+    # form-action 'self' limits where forms can submit. frame-ancestors 'none'
+    # blocks clickjacking via iframe embedding.
+    resp.headers.setdefault(
+        "Content-Security-Policy",
+        "default-src 'none'; "
+        "style-src 'unsafe-inline'; "
+        "img-src 'self'; "
+        "form-action 'self'; "
+        "frame-ancestors 'none'; "
+        "base-uri 'none'",
+    )
+    resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+    resp.headers.setdefault("X-Frame-Options", "DENY")
+    resp.headers.setdefault("Referrer-Policy", "no-referrer")
+    return resp
+
+
+@app.errorhandler(413)
+def _handle_413(_err):
+    return render_template_string(
+        REJOIN_UPLOAD_PAGE,
+        error="That CSV is too large. The upload cap is 1 MB.",
+    ), 413
+
+_OAUTH_STATE_TTL = 300
+_OAUTH_STATE_COOKIE = "oauth_state"
+_OAUTH_STATE_SALT = "oauth-state-v1"
+
+
+def _state_serializer() -> URLSafeTimedSerializer:
+    return URLSafeTimedSerializer(app.secret_key, salt=_OAUTH_STATE_SALT)
+
+
+def issue_oauth_state(flow: str) -> tuple[str, str]:
+    """Mint a (nonce, signed_cookie_value) pair for an outgoing OAuth redirect.
+
+    The nonce goes in the Slack ``state`` query parameter; the signed cookie
+    binds the flow to the user's browser. Both must match on callback.
+    """
+    nonce = secrets.token_urlsafe(24)
+    signed = _state_serializer().dumps({"nonce": nonce, "flow": flow})
+    return nonce, signed
+
+
+def consume_oauth_state(
+    flow: str, query_state: str | None, signed_cookie: str | None
+) -> bool:
+    """Return True iff the cookie's signature is valid, fresh, bound to ``flow``,
+    and its embedded nonce matches the query_state."""
+    if not query_state or not signed_cookie:
+        return False
+    try:
+        payload = _state_serializer().loads(
+            signed_cookie, max_age=_OAUTH_STATE_TTL
+        )
+    except BadData:
+        return False
+    if not isinstance(payload, dict):
+        return False
+    if payload.get("flow") != flow:
+        return False
+    nonce = payload.get("nonce")
+    if not isinstance(nonce, str) or not isinstance(query_state, str):
+        return False
+    return hmac.compare_digest(nonce, query_state)
+
+
+def _cookie_secure() -> bool:
+    """Cookies should always be Secure in prod. Operator opts in to plain HTTP
+    only for local dev via APP_ALLOW_INSECURE_COOKIES=1."""
+    return os.environ.get("APP_ALLOW_INSECURE_COOKIES") != "1"
+
+
+def _error_response_clearing_state(message: str, status: int):
+    """Render ERROR_PAGE and clear the oauth_state cookie. Use on any failure
+    path after consume_oauth_state has succeeded — the cookie has been logically
+    consumed and shouldn't linger in the browser."""
+    resp = make_response(render_template_string(ERROR_PAGE, error=message), status)
+    resp.delete_cookie(_OAUTH_STATE_COOKIE)
+    return resp
+
+
+def _missing_scopes(oauth_resp: dict, required: list[str]) -> list[str]:
+    """Return required scopes Slack did NOT grant. Empty list means OK."""
+    granted = {
+        s.strip()
+        for s in oauth_resp.get("authed_user", {}).get("scope", "").split(",")
+        if s.strip()
+    }
+    return sorted(set(required) - granted)
+
 
 CLIENT_ID = os.environ.get("SLACK_CLIENT_ID", "")
 CLIENT_SECRET = os.environ.get("SLACK_CLIENT_SECRET", "")
 
-# One-shot in-memory stash for the browser download: { token: (csv_bytes, filename) }.
-# The CSV is also delivered via Slack DM; this dict just keeps the "Download Again"
-# link working for a single fetch in the same session.
-_pending_downloads: dict[str, tuple[bytes, str]] = {}
+# One-shot in-memory stash for the browser download. CSV is also delivered via
+# Slack DM; this just keeps the "Download Again" link working for a single fetch.
+# Capped + TTL'd so an abandoned auto-redirect doesn't pin CSV bytes in memory
+# indefinitely.
+_pending_downloads: EphemeralStore = EphemeralStore(ttl_seconds=300, max_size=500)
 
 # Short-lived session for the /rejoin flow, bridging OAuth callback → file
-# upload. Keyed by an opaque cookie; value holds the Slack user token.
-_rejoin_sessions: dict[str, dict] = {}
+# upload. Capped + TTL'd so orphaned auths don't hold channels:write tokens
+# in memory forever.
 _REJOIN_SESSION_COOKIE = "rejoin_sid"
 _REJOIN_SESSION_TTL = 900  # 15 min — long enough to grab the CSV from Slack
+_rejoin_sessions: EphemeralStore = EphemeralStore(
+    ttl_seconds=_REJOIN_SESSION_TTL, max_size=500
+)
+_MAX_REJOIN_ROWS = 5000  # generous: well above any realistic Slack workspace
+
+_CSV_DANGEROUS_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _sanitize_csv_cell(value):
+    """Defuse CSV formula injection by prefixing risky cells with a single quote.
+
+    Excel/Sheets/Numbers interpret a leading =, +, -, @ (and some control chars)
+    as a formula. The leading quote forces text interpretation in all three.
+    """
+    if isinstance(value, str) and value and value[0] in _CSV_DANGEROUS_PREFIXES:
+        return "'" + value
+    return value
+
 
 USER_SCOPES = [
     "channels:read",
@@ -108,8 +277,6 @@ USER_SCOPES = [
 REJOIN_SCOPES = [
     "channels:write",
 ]
-
-state_store = InMemoryOAuthStateStore(expiration_seconds=300)
 
 LANDING_PAGE = """
 <!DOCTYPE html>
@@ -154,6 +321,7 @@ DONE_PAGE = """
 <html>
 <head>
     <title>Export Complete</title>
+    <meta http-equiv="refresh" content="0; url=/download/{{ token }}">
     <style>
         body { font-family: -apple-system, system-ui, sans-serif; max-width: 600px; margin: 80px auto; padding: 0 20px; color: #333; }
         h1 { font-size: 24px; }
@@ -392,14 +560,22 @@ def _absolute_url(endpoint: str) -> str:
 
 @app.route("/slack/auth")
 def slack_auth():
-    state = state_store.issue()
+    nonce, signed = issue_oauth_state("export")
     generator = AuthorizeUrlGenerator(
         client_id=CLIENT_ID,
         user_scopes=USER_SCOPES,
         redirect_uri=_absolute_url("slack_callback"),
     )
-    url = generator.generate(state=state)
-    return redirect(url)
+    resp = redirect(generator.generate(state=nonce))
+    resp.set_cookie(
+        _OAUTH_STATE_COOKIE,
+        signed,
+        max_age=_OAUTH_STATE_TTL,
+        httponly=True,
+        secure=_cookie_secure(),
+        samesite="Lax",
+    )
+    return resp
 
 
 @app.route("/slack/callback")
@@ -411,8 +587,11 @@ def slack_callback():
     if error:
         return render_template_string(ERROR_PAGE, error=f"Slack authorization failed: {error}"), 400
 
-    if not state_store.consume(state):
-        return render_template_string(ERROR_PAGE, error="Invalid or expired state. Please try again."), 400
+    signed_state = request.cookies.get(_OAUTH_STATE_COOKIE)
+    if not consume_oauth_state("export", state, signed_state):
+        return _error_response_clearing_state(
+            "Invalid or expired state. Please try again.", 400
+        )
 
     # Exchange code for user token
     client = WebClient()
@@ -424,15 +603,25 @@ def slack_callback():
             redirect_uri=_absolute_url("slack_callback"),
         )
     except SlackApiError as e:
-        return render_template_string(ERROR_PAGE, error=f"OAuth error: {e.response['error']}"), 500
+        return _error_response_clearing_state(
+            f"OAuth error: {e.response['error']}", 500
+        )
+
+    missing = _missing_scopes(oauth_resp, USER_SCOPES)
+    if missing:
+        return _error_response_clearing_state(
+            f"Missing required scopes: {', '.join(missing)}.", 400
+        )
 
     user_token = oauth_resp.get("authed_user", {}).get("access_token")
     user_id = oauth_resp.get("authed_user", {}).get("id")
     granted_scopes = oauth_resp.get("authed_user", {}).get("scope", "")
-    print(f"[oauth] user={user_id} granted_scopes={granted_scopes}", flush=True)
+    logger.info(
+        "oauth completed user_id=%s granted_scopes=%s", user_id, granted_scopes
+    )
 
     if not user_token:
-        return render_template_string(ERROR_PAGE, error="No user token received."), 500
+        return _error_response_clearing_state("No user token received.", 500)
 
     user_client = WebClient(token=user_token)
 
@@ -440,7 +629,11 @@ def slack_callback():
     try:
         user_info = user_client.users_info(user=user_id)
         user_name = user_info["user"]["profile"].get("real_name", user_id)
-    except SlackApiError:
+    except SlackApiError as e:
+        logger.info(
+            "users_info failed, falling back to user_id: %s",
+            e.response.get("error", "unknown") if hasattr(e, "response") else "unknown",
+        )
         user_name = user_id
 
     # Fetch all channels (public + private only — DMs/group DMs are out of scope)
@@ -454,7 +647,9 @@ def slack_callback():
                 cursor=cursor,
             )
         except SlackApiError as e:
-            return render_template_string(ERROR_PAGE, error=f"API error: {e.response['error']}"), 500
+            return _error_response_clearing_state(
+                f"API error: {e.response['error']}", 500
+            )
 
         channels.extend(resp["channels"])
         cursor = resp.get("response_metadata", {}).get("next_cursor")
@@ -488,7 +683,13 @@ def slack_callback():
     buf = io.StringIO()
     writer = csv.DictWriter(buf, fieldnames=fieldnames)
     writer.writeheader()
-    writer.writerows(rows)
+    # Sanitize at write time only — leaves `rows` untouched so the markdown
+    # checklist below still renders channel names without a leading quote.
+    sanitized_rows = [
+        {k: _sanitize_csv_cell(v) for k, v in row.items()}
+        for row in rows
+    ]
+    writer.writerows(sanitized_rows)
     csv_bytes = buf.getvalue().encode("utf-8")
 
     md_bytes = build_markdown_checklist(rows).encode("utf-8")
@@ -521,34 +722,40 @@ def slack_callback():
         dm_status = "sent"
     except SlackApiError as e:
         dm_status = f"failed: {e.response['error']}"
-        print(f"[upload] failed: {e.response.data}", flush=True)
+        logger.warning("slack file upload failed: %s", e.response.get("error", "unknown"))
 
     # Revoke the user token immediately — we don't need it anymore
     try:
         user_client.auth_revoke()
-    except SlackApiError:
-        pass  # best effort
+    except SlackApiError as e:
+        logger.warning(
+            "auth_revoke failed (export flow): %s",
+            e.response.get("error", "unknown") if hasattr(e, "response") else "unknown",
+        )
 
-    # Stash CSV in memory for a single browser download. The token is opaque
-    # and the entry is popped on first GET.
+    # Stash CSV in memory for a single browser download. Token is opaque; the
+    # entry is popped on first GET, and the store TTL-evicts orphaned entries.
     token = secrets.token_urlsafe(16)
-    _pending_downloads[token] = (csv_bytes, csv_filename)
+    _pending_downloads.put(token, (csv_bytes, csv_filename))
 
-    return render_template_string(
-        DONE_PAGE
-        + '<script>window.location.href="/download/{{ token }}";</script>',
-        user_name=user_name,
-        user_id=user_id,
-        total=len(rows),
-        counts=counts,
-        token=token,
-        dm_status=dm_status,
+    resp = make_response(
+        render_template_string(
+            DONE_PAGE,
+            user_name=user_name,
+            user_id=user_id,
+            total=len(rows),
+            counts=counts,
+            token=token,
+            dm_status=dm_status,
+        )
     )
+    resp.delete_cookie(_OAUTH_STATE_COOKIE)
+    return resp
 
 
 @app.route("/download/<token>")
 def download(token):
-    entry = _pending_downloads.pop(token, None)
+    entry = _pending_downloads.pop(token)
     if entry is None:
         return render_template_string(
             ERROR_PAGE,
@@ -570,13 +777,22 @@ def rejoin_index():
 
 @app.route("/rejoin/auth")
 def rejoin_auth():
-    state = state_store.issue()
+    nonce, signed = issue_oauth_state("rejoin")
     generator = AuthorizeUrlGenerator(
         client_id=CLIENT_ID,
         user_scopes=REJOIN_SCOPES,
         redirect_uri=_absolute_url("rejoin_callback"),
     )
-    return redirect(generator.generate(state=state))
+    resp = redirect(generator.generate(state=nonce))
+    resp.set_cookie(
+        _OAUTH_STATE_COOKIE,
+        signed,
+        max_age=_OAUTH_STATE_TTL,
+        httponly=True,
+        secure=_cookie_secure(),
+        samesite="Lax",
+    )
+    return resp
 
 
 @app.route("/slack/rejoin_callback")
@@ -587,8 +803,11 @@ def rejoin_callback():
 
     if error:
         return render_template_string(ERROR_PAGE, error=f"Slack authorization failed: {error}"), 400
-    if not state_store.consume(state):
-        return render_template_string(ERROR_PAGE, error="Invalid or expired state. Please try again."), 400
+    signed_state = request.cookies.get(_OAUTH_STATE_COOKIE)
+    if not consume_oauth_state("rejoin", state, signed_state):
+        return _error_response_clearing_state(
+            "Invalid or expired state. Please try again.", 400
+        )
 
     client = WebClient()
     try:
@@ -599,28 +818,33 @@ def rejoin_callback():
             redirect_uri=_absolute_url("rejoin_callback"),
         )
     except SlackApiError as e:
-        return render_template_string(ERROR_PAGE, error=f"OAuth error: {e.response['error']}"), 500
+        return _error_response_clearing_state(
+            f"OAuth error: {e.response['error']}", 500
+        )
+
+    missing = _missing_scopes(oauth_resp, REJOIN_SCOPES)
+    if missing:
+        return _error_response_clearing_state(
+            f"Missing required scopes: {', '.join(missing)}.", 400
+        )
 
     user_token = oauth_resp.get("authed_user", {}).get("access_token")
     user_id = oauth_resp.get("authed_user", {}).get("id")
     if not user_token:
-        return render_template_string(ERROR_PAGE, error="No user token received."), 500
+        return _error_response_clearing_state("No user token received.", 500)
 
     sid = secrets.token_urlsafe(24)
-    _rejoin_sessions[sid] = {
-        "token": user_token,
-        "user_id": user_id,
-        "expires_at": time.time() + _REJOIN_SESSION_TTL,
-    }
+    _rejoin_sessions.put(sid, {"token": user_token, "user_id": user_id})
     resp = redirect(url_for("rejoin_upload"))
     resp.set_cookie(
         _REJOIN_SESSION_COOKIE,
         sid,
         max_age=_REJOIN_SESSION_TTL,
         httponly=True,
-        secure=request.is_secure,
+        secure=_cookie_secure(),
         samesite="Lax",
     )
+    resp.delete_cookie(_OAUTH_STATE_COOKIE)
     return resp
 
 
@@ -628,9 +852,8 @@ def _get_rejoin_session() -> tuple[str | None, dict | None]:
     sid = request.cookies.get(_REJOIN_SESSION_COOKIE)
     if not sid:
         return None, None
-    session = _rejoin_sessions.get(sid)
-    if not session or session["expires_at"] < time.time():
-        _rejoin_sessions.pop(sid, None)
+    session = _rejoin_sessions.peek(sid)
+    if session is None:
         return None, None
     return sid, session
 
@@ -657,10 +880,19 @@ def rejoin_upload():
         return render_template_string(REJOIN_UPLOAD_PAGE, error="That file isn't UTF-8 CSV."), 400
 
     reader = csv.DictReader(io.StringIO(text))
-    rows = list(reader)
+    rows: list[dict] = []
+    for row in reader:
+        if len(rows) >= _MAX_REJOIN_ROWS:
+            return render_template_string(
+                REJOIN_UPLOAD_PAGE,
+                error=f"CSV exceeds {_MAX_REJOIN_ROWS} rows. Trim and try again.",
+            ), 400
+        rows.append(row)
+
     public_rows = [
         r for r in rows
-        if r.get("type") == "Public Channel" and r.get("is_archived", "False") != "True"
+        if r.get("type") == "Public Channel"
+        and r.get("is_archived", "False") != "True"
     ]
 
     user_client = WebClient(token=session["token"])
@@ -694,9 +926,12 @@ def rejoin_upload():
     # Best-effort token revoke + session cleanup
     try:
         user_client.auth_revoke()
-    except SlackApiError:
-        pass
-    _rejoin_sessions.pop(sid, None)
+    except SlackApiError as e:
+        logger.warning(
+            "auth_revoke failed (rejoin flow): %s",
+            e.response.get("error", "unknown") if hasattr(e, "response") else "unknown",
+        )
+    _rejoin_sessions.discard(sid)
 
     html = render_template_string(
         REJOIN_DONE_PAGE,
@@ -716,5 +951,7 @@ if __name__ == "__main__":
     if not CLIENT_ID or not CLIENT_SECRET:
         print("Set SLACK_CLIENT_ID and SLACK_CLIENT_SECRET", file=sys.stderr)
         sys.exit(1)
-    print(f"Running at http://localhost:5001")
-    app.run(port=5001, debug=True)
+    debug = os.environ.get("FLASK_DEBUG", "0").strip().lower() in ("1", "true", "yes", "on")
+    port = int(os.environ.get("PORT", "5001"))
+    logger.info("Running at http://localhost:%d (debug=%s)", port, debug)
+    app.run(host="127.0.0.1", port=port, debug=debug)

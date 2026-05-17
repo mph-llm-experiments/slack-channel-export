@@ -94,10 +94,14 @@ gcloud secrets create slack-client-id --replication-policy=automatic
 printf '%s' "$SLACK_CLIENT_ID" | gcloud secrets versions add slack-client-id --data-file=-
 gcloud secrets create slack-client-secret --replication-policy=automatic
 printf '%s' "$SLACK_CLIENT_SECRET" | gcloud secrets versions add slack-client-secret --data-file=-
+# APP_SECRET_KEY signs the OAuth state cookie — generate a fresh value with:
+#   python -c 'import secrets; print(secrets.token_urlsafe(32))'
+gcloud secrets create app-secret-key --replication-policy=automatic
+printf '%s' "$APP_SECRET_KEY" | gcloud secrets versions add app-secret-key --data-file=-
 
 PROJECT_NUMBER=$(gcloud projects describe mph-gcloud-cli --format='value(projectNumber)')
 RUNTIME_SA="${PROJECT_NUMBER}-compute@developer.gserviceaccount.com"
-for s in slack-client-id slack-client-secret; do
+for s in slack-client-id slack-client-secret app-secret-key; do
   gcloud secrets add-iam-policy-binding $s \
     --member="serviceAccount:${RUNTIME_SA}" \
     --role="roles/secretmanager.secretAccessor"
@@ -115,7 +119,7 @@ gcloud run deploy slack-channel-export \
   --memory 512Mi \
   --timeout 3600 \
   --allow-unauthenticated \
-  --set-secrets SLACK_CLIENT_ID=slack-client-id:latest,SLACK_CLIENT_SECRET=slack-client-secret:latest
+  --set-secrets SLACK_CLIENT_ID=slack-client-id:latest,SLACK_CLIENT_SECRET=slack-client-secret:latest,APP_SECRET_KEY=app-secret-key:latest
 ```
 
 (`--allow-unauthenticated` here means "no Cloud Run IAM auth required" — Cloud IAP is the real gate.)
@@ -129,6 +133,26 @@ gcloud beta iap web add-iam-policy-binding \
   --member=domain:puddingtime.net --role=roles/iap.httpsResourceAccessor
 ```
 
+## Environment variables
+
+- `SLACK_CLIENT_ID` / `SLACK_CLIENT_SECRET` — required. Copy from your Slack app's Basic Information page.
+- `APP_SECRET_KEY` — required in production. The app exits at startup if this is
+  unset and `FLASK_DEBUG` is not enabled. Signs the short-lived OAuth `state`
+  cookie that binds the OAuth callback to the user's browser. Generate one with:
+  `python -c 'import secrets; print(secrets.token_urlsafe(32))'`. If
+  `FLASK_DEBUG=1` is set and `APP_SECRET_KEY` is unset, an ephemeral key is used
+  (dev only — restarts strand in-flight handshakes).
+- `APP_ALLOW_INSECURE_COOKIES=1` — local-dev only. Without this, cookies are
+  always set with the `Secure` flag. Do not set in production.
+- `FLASK_DEBUG=1` — local-dev only. Enables the Werkzeug interactive debugger.
+  The dev server only binds to 127.0.0.1, but never set this in any deployment.
+  Any truthy spelling works (`1`, `true`, `yes`, `on`); anything else is treated
+  as off.
+- `LOG_LEVEL` — defaults to `INFO`. Set to `DEBUG` for verbose logs or `WARNING`
+  to quiet the OAuth-completion line in production.
+
+OAuth `state` is signed and stored in a short-lived HttpOnly cookie scoped to the flow. No server-side state store is used; the signed cookie itself is the state — binding the OAuth callback to the user's browser and preventing cross-flow reuse.
+
 ## Local dev
 
 ```bash
@@ -136,6 +160,8 @@ python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 export SLACK_CLIENT_ID=...
 export SLACK_CLIENT_SECRET=...
+export APP_SECRET_KEY=...          # or omit for ephemeral key (dev only)
+export APP_ALLOW_INSECURE_COOKIES=1  # required for http://localhost
 .venv/bin/python slack_channel_export_selfservice_1.py
 # http://localhost:5001
 ```

@@ -79,7 +79,9 @@ https://<service-url>/slack/rejoin_callback
 One-time per project:
 
 ```bash
-gcloud config set project mph-gcloud-cli
+PROJECT=<your-project-id>
+
+gcloud config set project $PROJECT
 gcloud config set run/region us-west1
 
 gcloud services enable \
@@ -99,7 +101,7 @@ printf '%s' "$SLACK_CLIENT_SECRET" | gcloud secrets versions add slack-client-se
 gcloud secrets create app-secret-key --replication-policy=automatic
 printf '%s' "$APP_SECRET_KEY" | gcloud secrets versions add app-secret-key --data-file=-
 
-PROJECT_NUMBER=$(gcloud projects describe mph-gcloud-cli --format='value(projectNumber)')
+PROJECT_NUMBER=$(gcloud projects describe $PROJECT --format='value(projectNumber)')
 RUNTIME_SA="${PROJECT_NUMBER}-compute@developer.gserviceaccount.com"
 for s in slack-client-id slack-client-secret app-secret-key; do
   gcloud secrets add-iam-policy-binding $s \

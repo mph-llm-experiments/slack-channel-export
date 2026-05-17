@@ -12,6 +12,11 @@ signed cookie (`oauth_state`) carrying `{nonce, flow}`. On callback we verify:
 3. The `flow` field matches the callback route (`"export"` or `"rejoin"`).
 4. The `nonce` matches the `state` query parameter Slack sent back.
 
+The nonce comparison uses `hmac.compare_digest` to avoid leaking any timing
+signal even though the practical attacker would already need to know the nonce
+to mount a useful attack (it's carried in the signed cookie, which requires the
+secret key to forge).
+
 This binds each OAuth handshake to a single browser and a single flow. A
 state issued for the export flow cannot be used to complete the rejoin flow
 or vice versa. The cookie is HttpOnly, SameSite=Lax, and Secure (unless the
@@ -70,6 +75,12 @@ After the OAuth code exchange, we verify the user actually granted every
 scope we asked for (`USER_SCOPES` for export, `REJOIN_SCOPES` for rejoin).
 A user who declines a subset is rejected with a 400 listing the missing
 scopes, so we never proceed with a token that can't do the work.
+
+## Operational requirements
+
+`APP_SECRET_KEY` is required at startup unless `FLASK_DEBUG=1` is set. The app
+exits with `[error] APP_SECRET_KEY is required in production...` if the key is
+missing in a non-dev environment.
 
 ## What this app deliberately does not do
 

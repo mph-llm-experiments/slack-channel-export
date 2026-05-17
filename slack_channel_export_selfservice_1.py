@@ -35,6 +35,7 @@ Usage:
 """
 
 import csv
+import hmac
 import io
 import logging
 import os
@@ -118,7 +119,19 @@ app = Flask(__name__)
 # url_for(..., _external=True) returns https:// URLs that match the Slack app's
 # configured redirect URIs.
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
-app.secret_key = os.environ.get("APP_SECRET_KEY") or secrets.token_urlsafe(32)
+_app_secret_key_env = os.environ.get("APP_SECRET_KEY")
+if not _app_secret_key_env:
+    _flask_debug = os.environ.get("FLASK_DEBUG", "0").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+    if not _flask_debug:
+        logger.error(
+            "APP_SECRET_KEY is required in production; set FLASK_DEBUG=1 for a "
+            "local-dev ephemeral fallback."
+        )
+        sys.exit(1)
+    logger.warning("APP_SECRET_KEY not set; using an ephemeral key (dev only)")
+app.secret_key = _app_secret_key_env or secrets.token_urlsafe(32)
 # Channel exports are small (a few KB) — 1 MB is generous and stops a casual
 # attacker from OOM'ing the worker via the rejoin upload endpoint.
 app.config["MAX_CONTENT_LENGTH"] = 1 * 1024 * 1024
@@ -145,10 +158,12 @@ def _add_security_headers(resp):
     return resp
 
 
-if not os.environ.get("APP_SECRET_KEY"):
-    # Ephemeral key: fine for dev, but in-flight OAuth flows break on restart.
-    # Production should set APP_SECRET_KEY explicitly.
-    logger.warning("APP_SECRET_KEY not set; using an ephemeral key")
+@app.errorhandler(413)
+def _handle_413(_err):
+    return render_template_string(
+        REJOIN_UPLOAD_PAGE,
+        error="That CSV is too large. The upload cap is 1 MB.",
+    ), 413
 
 _OAUTH_STATE_TTL = 300
 _OAUTH_STATE_COOKIE = "oauth_state"
@@ -183,11 +198,14 @@ def consume_oauth_state(
         )
     except BadData:
         return False
-    return (
-        isinstance(payload, dict)
-        and payload.get("flow") == flow
-        and payload.get("nonce") == query_state
-    )
+    if not isinstance(payload, dict):
+        return False
+    if payload.get("flow") != flow:
+        return False
+    nonce = payload.get("nonce")
+    if not isinstance(nonce, str) or not isinstance(query_state, str):
+        return False
+    return hmac.compare_digest(nonce, query_state)
 
 
 def _cookie_secure() -> bool:

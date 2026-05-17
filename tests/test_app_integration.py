@@ -99,3 +99,12 @@ def test_done_page_uses_meta_refresh_not_inline_script(app_mod):
     # The auto-redirect must not rely on inline script — CSP forbids it.
     assert "<script>" not in app_mod.DONE_PAGE
     assert 'http-equiv="refresh"' in app_mod.DONE_PAGE
+
+
+def test_rejoin_upload_rejects_unknown_session(client):
+    # Cookie set but no session in the store (e.g., TTL'd out or worker restart).
+    # _get_rejoin_session should return (None, None) and the route should 401.
+    client.set_cookie("rejoin_sid", "not-in-the-store", domain="localhost")
+    resp = client.get("/rejoin/upload")
+    assert resp.status_code == 401
+    assert b"Session expired" in resp.data

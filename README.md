@@ -136,11 +136,12 @@ gcloud beta iap web add-iam-policy-binding \
 ## Environment variables
 
 - `SLACK_CLIENT_ID` / `SLACK_CLIENT_SECRET` — required. Copy from your Slack app's Basic Information page.
-- `APP_SECRET_KEY` — required in production. Signs the short-lived OAuth `state`
+- `APP_SECRET_KEY` — required in production. The app exits at startup if this is
+  unset and `FLASK_DEBUG` is not enabled. Signs the short-lived OAuth `state`
   cookie that binds the OAuth callback to the user's browser. Generate one with:
-  `python -c 'import secrets; print(secrets.token_urlsafe(32))'`. If unset, an
-  ephemeral key is generated and a warning is logged; restarts strand in-flight
-  OAuth handshakes.
+  `python -c 'import secrets; print(secrets.token_urlsafe(32))'`. If
+  `FLASK_DEBUG=1` is set and `APP_SECRET_KEY` is unset, an ephemeral key is used
+  (dev only — restarts strand in-flight handshakes).
 - `APP_ALLOW_INSECURE_COOKIES=1` — local-dev only. Without this, cookies are
   always set with the `Secure` flag. Do not set in production.
 - `FLASK_DEBUG=1` — local-dev only. Enables the Werkzeug interactive debugger.

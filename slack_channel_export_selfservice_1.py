@@ -31,7 +31,7 @@ Usage:
     # User visits http://localhost:5001
     # Clicks "Export My Channels"
     # Authorizes with Slack
-    # CSV + Markdown checklist are DM'd to them; one-shot CSV download in the browser
+    # CSV + Markdown checklist are DM'd to them
 """
 
 import csv
@@ -46,7 +46,7 @@ import time
 from collections import Counter
 from datetime import datetime
 
-from flask import Flask, make_response, redirect, request, send_file, render_template_string, url_for
+from flask import Flask, make_response, redirect, request, render_template_string, url_for
 from itsdangerous import BadData, URLSafeTimedSerializer
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
@@ -65,9 +65,9 @@ if not logging.getLogger().handlers:
 class EphemeralStore:
     """Thread-safe in-memory store with per-entry TTL and a hard size cap.
 
-    Holds short-lived per-request artifacts (CSV download payloads, rejoin
-    session tokens) without unbounded memory growth. Lazy sweep on every op
-    so a quiet period followed by a burst still self-cleans.
+    Holds short-lived per-request artifacts (rejoin session tokens) without
+    unbounded memory growth. Lazy sweep on every op so a quiet period followed
+    by a burst still self-cleans.
     """
 
     def __init__(self, ttl_seconds: float, max_size: int = 1000):
@@ -236,12 +236,6 @@ def _missing_scopes(oauth_resp: dict, required: list[str]) -> list[str]:
 CLIENT_ID = os.environ.get("SLACK_CLIENT_ID", "")
 CLIENT_SECRET = os.environ.get("SLACK_CLIENT_SECRET", "")
 
-# One-shot in-memory stash for the browser download. CSV is also delivered via
-# Slack DM; this just keeps the "Download Again" link working for a single fetch.
-# Capped + TTL'd so an abandoned auto-redirect doesn't pin CSV bytes in memory
-# indefinitely.
-_pending_downloads: EphemeralStore = EphemeralStore(ttl_seconds=300, max_size=500)
-
 # Short-lived session for the /rejoin flow, bridging OAuth callback → file
 # upload. Capped + TTL'd so orphaned auths don't hold channels:write tokens
 # in memory forever.
@@ -302,7 +296,7 @@ LANDING_PAGE = """
         <ul>
             <li>Exports a CSV of every channel you're in (public + private)</li>
             <li>Includes a friendly Markdown checklist for the private channels you'll need help getting back into</li>
-            <li>DMs both files to you in Slack and offers a one-time CSV download</li>
+            <li>DMs both files to you in Slack</li>
             <li>Does NOT export DMs, group DMs, or any message content</li>
         </ul>
         <strong>Heads up:</strong> nothing is stored server-side. This tool hands
@@ -321,7 +315,6 @@ DONE_PAGE = """
 <html>
 <head>
     <title>Export Complete</title>
-    <meta http-equiv="refresh" content="0; url=/download/{{ token }}">
     <style>
         body { font-family: -apple-system, system-ui, sans-serif; max-width: 600px; margin: 80px auto; padding: 0 20px; color: #333; }
         h1 { font-size: 24px; }
@@ -342,13 +335,12 @@ DONE_PAGE = """
     </div>
     {% if dm_status == "sent" %}
       <p>Your CSV and welcome-back Markdown checklist have been DM'd to you in Slack.
-         The browser download for the CSV should also start automatically — save it now,
-         nothing is stored on this server.</p>
+         Save your own copies — nothing is stored on this server.</p>
     {% else %}
-      <p>Your CSV download should start automatically. Save it now — nothing is stored on this server.
-         {% if dm_status %}<br><small>(Slack DM {{ dm_status }}.)</small>{% endif %}</p>
+      <p><strong>We couldn't DM your files to you</strong>{% if dm_status %}
+         (Slack DM {{ dm_status }}){% endif %}. Nothing is stored on this server,
+         so please <a href="/">run the export again</a>.</p>
     {% endif %}
-    <a class="btn" href="/download/{{ token }}">Download</a>
 </body>
 </html>
 """
@@ -733,11 +725,6 @@ def slack_callback():
             e.response.get("error", "unknown") if hasattr(e, "response") else "unknown",
         )
 
-    # Stash CSV in memory for a single browser download. Token is opaque; the
-    # entry is popped on first GET, and the store TTL-evicts orphaned entries.
-    token = secrets.token_urlsafe(16)
-    _pending_downloads.put(token, (csv_bytes, csv_filename))
-
     resp = make_response(
         render_template_string(
             DONE_PAGE,
@@ -745,29 +732,11 @@ def slack_callback():
             user_id=user_id,
             total=len(rows),
             counts=counts,
-            token=token,
             dm_status=dm_status,
         )
     )
     resp.delete_cookie(_OAUTH_STATE_COOKIE)
     return resp
-
-
-@app.route("/download/<token>")
-def download(token):
-    entry = _pending_downloads.pop(token)
-    if entry is None:
-        return render_template_string(
-            ERROR_PAGE,
-            error="Download link expired or already used. The CSV is in your Slack DMs.",
-        ), 404
-    csv_bytes, filename = entry
-    return send_file(
-        io.BytesIO(csv_bytes),
-        as_attachment=True,
-        download_name=filename,
-        mimetype="text/csv",
-    )
 
 
 @app.route("/rejoin")

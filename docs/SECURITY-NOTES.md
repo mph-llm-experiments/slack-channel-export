@@ -27,12 +27,12 @@ validation API failure, and success.
 
 ## In-memory stores
 
-`_pending_downloads` and `_rejoin_sessions` are `EphemeralStore` instances —
-TTL + hard size cap + lazy sweep, lock-protected. They are process-local,
-which is why the Dockerfile runs gunicorn with `--workers 1`. Adding workers
-will break the download stash and rejoin sessions across worker boundaries.
+`_rejoin_sessions` is an `EphemeralStore` instance — TTL + hard size cap +
+lazy sweep, lock-protected. It is process-local, which is why the Dockerfile
+runs gunicorn with `--workers 1`. Adding workers will break rejoin sessions
+across worker boundaries.
 
-If we ever need to scale beyond a single worker, both stores need to move
+If we ever need to scale beyond a single worker, the store needs to move
 to a shared backend (Redis or a signed cookie carrying the rejoin token
 directly). Don't bump `--workers` without that change.
 
@@ -64,8 +64,7 @@ row keeps the rule simple.
 
 A strict CSP (`default-src 'none'; style-src 'unsafe-inline'; img-src 'self';
 form-action 'self'; frame-ancestors 'none'; base-uri 'none'`) is applied via
-`@app.after_request`. We do not use any inline scripts; the auto-redirect to
-the download is a `<meta http-equiv="refresh">`. Other standard headers:
+`@app.after_request`. We do not use any inline scripts. Other standard headers:
 `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy:
 no-referrer`.
 

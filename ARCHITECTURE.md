@@ -28,7 +28,6 @@ Used at most a few times per person per year. Volume is low; correctness and min
    │ ┌────────────────────────────────────────────────────────┐ │
    │ │ Flask app (gunicorn, 1 worker, 8 threads)              │ │
    │ │  - in-memory OAuth state store (5 min TTL)             │ │
-   │ │  - in-memory CSV download stash (one-shot, popped)     │ │
    │ │  - in-memory rejoin session store (15 min TTL)         │ │
    │ └────────────────────────────────────────────────────────┘ │
    └─────────────────────────────────────────────────────────────┘
@@ -78,8 +77,7 @@ Server actions in the callback, in order:
 4. Build CSV + Markdown checklist *in memory only*.
 5. Open self-DM via `conversations.open(users=<self>)` and `files.upload_v2` twice (MD then CSV).
 6. `auth.revoke()` the user token (best-effort).
-7. Stash CSV bytes in a process-local `EphemeralStore` keyed by a `secrets.token_urlsafe(16)` token; render success page that auto-triggers a one-shot download.
-8. The `/download/<token>` route pops the entry on first GET, after which it returns 404.
+7. Render the success page. Delivery is Slack DM only — if the DM upload failed, the page says so and tells the user to run the export again (nothing is retained server-side).
 
 ### Rejoin (`/rejoin/auth` → `/slack/rejoin_callback` → `/rejoin/upload`)
 
@@ -114,7 +112,7 @@ The Slack signing secret is not used — this app has no incoming Slack webhooks
 ## Data handling
 
 - **Slack user tokens** live only in process memory, for the duration of one HTTP request (export) or up to 15 minutes (rejoin, between OAuth and upload), and are revoked via `auth.revoke()` immediately after use.
-- **CSV / Markdown files** are built in memory, sent to Slack as the user's own files, and stashed in memory only for the one-shot browser download. Nothing is written to disk inside the container.
+- **CSV / Markdown files** are built in memory and sent to Slack as the user's own files. They are not retained after the request — no browser download path exists. Nothing is written to disk inside the container.
 - **No logs of channel content.** The app uses the `logging` module (format: `%(asctime)s %(levelname)s %(name)s %(message)s`) and emits lines such as `oauth completed user_id=… granted_scopes=…` and upload failure details to stdout (Cloud Logging captures stdout). No channel names, IDs, message content, or CSV bodies are logged.
 - **Channel IDs in the CSV** are not secret per se — they're visible to any member of the workspace.
 
@@ -130,16 +128,15 @@ The Slack signing secret is not used — this app has no incoming Slack webhooks
 | OAuth code interception | `state` parameter is a 24-byte URL-safe nonce bound to a signed `oauth_state` cookie (`{nonce, flow}`, itsdangerous, salt `oauth-state-v1`, 5-min TTL); signature, age, flow match, and nonce match all verified before code exchange; cookie deleted on every terminal path |
 | Cross-flow code replay (export code used at rejoin callback or vice versa) | `redirect_uri` is passed explicitly on both `AuthorizeUrlGenerator.generate()` and `oauth.v2.access()`; Slack enforces that the redirect URI must match what was used at authorize time |
 | Token theft via logging or persistence | Tokens never written to disk or logs; revoked immediately after use |
-| Download link sharing / replay | One-shot token, popped on first GET, then 404 |
+| Download link sharing / replay | N/A — the browser download path was removed; exports are delivered via Slack DM only |
 | Session cookie theft | `httpOnly` + `Secure` (in prod) + `SameSite=Lax` + 15-min max-age; session is also explicitly invalidated server-side after the upload completes |
-| Path traversal on download | Route uses opaque tokens as the key into an `EphemeralStore`, not a filesystem path |
 | Stack overflow / large CSV upload | `MAX_CONTENT_LENGTH` is set to 1 MB; the row parser additionally caps at 5 000 rows |
 | Slack API rate limits | Caught and surfaced; user can re-run with the same CSV and pick up where they left off |
-| Pre-image of state values | All tokens (state nonce, download token, rejoin sid) use `secrets.token_urlsafe(N)` — CSPRNG, no UUID fallback |
+| Pre-image of state values | All tokens (state nonce, rejoin sid) use `secrets.token_urlsafe(N)` — CSPRNG, no UUID fallback |
 
 ### Out of scope / accepted
 
-- **Multi-instance consistency.** In-memory state and download stash assume one process. We enforce this with `--min-instances=1 --max-instances=1`. If we ever lift that limit, we'd need to move state to a shared store. The README and deploy command both bake this in.
+- **Multi-instance consistency.** In-memory rejoin session state assumes one process. We enforce this with `--min-instances=1 --max-instances=1`. If we ever lift that limit, we'd need to move state to a shared store. The README and deploy command both bake this in.
 - **Long downtime during deploy.** Single instance means a brief gap on `gcloud run deploy`. Acceptable for a low-volume internal tool.
 - **Compromised Slack OAuth app.** If the `SLACK_CLIENT_SECRET` leaks, an attacker could prompt users to authorize with the existing client ID; mitigated by access being IAP-gated, but rotation procedure (regenerate in Slack admin, update Secret Manager, redeploy) should be exercised.
 - **Compromised Google Workspace account.** Out of scope; covered by Workspace IAM/IAP.
@@ -148,7 +145,7 @@ The Slack signing secret is not used — this app has no incoming Slack webhooks
 ## Open issues to flag in review
 
 1. **Consider granular scope `channels:write.invites` vs `channels:write`** for the rejoin flow. We use `channels:write` for `conversations.join`; the more granular split has moved over time in Slack's docs.
-2. **Process-local session and download stash** survive only until the next instance restart. This is by design (lower retention is better) but means a redeploy mid-flow makes the user start over. Acceptable for the volume.
+2. **Process-local rejoin sessions** survive only until the next instance restart. This is by design (lower retention is better) but means a redeploy mid-flow makes the user start over. Acceptable for the volume.
 3. **No CSRF protection on the `/rejoin/upload` POST.** A future attacker page rendered in the user's browser cannot read the IAP-gated upload page (cross-origin), so the form submission can't be forged from off-site. If we ever exposed this without IAP, we'd need to add a CSRF token on the form.
 4. **The IAP audience cookie used in OAuth callbacks** travels back with Slack's redirect. We rely on `SameSite=Lax` here. The IAP cookie itself is set by Google and not under our control.
 

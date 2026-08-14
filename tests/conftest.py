@@ -24,7 +24,7 @@ def app():
     app_module.app.config["TESTING"] = True
     yield app_module.app
     # Reset module-level EphemeralStores so state doesn't leak between tests.
-    for name in ("_pending_downloads", "_rejoin_sessions"):
+    for name in ("_rejoin_sessions",):
         store = getattr(app_module, name, None)
         if store is not None and hasattr(store, "_items"):
             with store._lock:

@@ -10,7 +10,7 @@ Read [ARCHITECTURE.md](./ARCHITECTURE.md) for the design + threat model. README.
 
 ## Conventions worth keeping
 
-- **No server-side persistence.** Everything lives in process memory: OAuth state store, rejoin session map, one-shot download stash. If a future change needs to persist anything, raise the concern explicitly — it changes the data-handling story in ARCHITECTURE.md and the threat model.
+- **No server-side persistence.** Everything lives in process memory: OAuth state store, rejoin session map. If a future change needs to persist anything, raise the concern explicitly — it changes the data-handling story in ARCHITECTURE.md and the threat model.
 - **Single-instance Cloud Run on purpose.** `--min-instances=1 --max-instances=1`. The in-memory stores aren't safe across instances. Don't bump max-instances without also moving state to a shared backend.
 - **Two flows, two scope sets, two redirect URLs.** Don't merge them. Export needs file/DM scopes; rejoin needs `channels:write`. Asking for the union expands what users grant.
 - **Tokens get revoked.** Both flows call `auth_revoke()` (best-effort) on the user token as soon as the work is done. Keep doing this.

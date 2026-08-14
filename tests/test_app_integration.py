@@ -8,12 +8,6 @@ def test_app_module_does_not_enable_debug_at_import_time(app):
     assert app.debug is False
 
 
-def test_pending_downloads_is_capped(app_mod):
-    # The download stash must use EphemeralStore so memory can't grow unbounded.
-    from slack_channel_export_selfservice_1 import EphemeralStore
-    assert isinstance(app_mod._pending_downloads, EphemeralStore)
-
-
 def test_rejoin_sessions_is_capped(app_mod):
     from slack_channel_export_selfservice_1 import EphemeralStore
     assert isinstance(app_mod._rejoin_sessions, EphemeralStore)
@@ -95,10 +89,17 @@ def test_security_headers_on_landing(client):
     assert "frame-ancestors 'none'" in csp
 
 
-def test_done_page_uses_meta_refresh_not_inline_script(app_mod):
-    # The auto-redirect must not rely on inline script — CSP forbids it.
+def test_done_page_has_no_browser_download(app_mod):
+    # Files are delivered via Slack DM only; the one-shot browser download
+    # (and its always-errors-after-use Download button) was removed.
     assert "<script>" not in app_mod.DONE_PAGE
-    assert 'http-equiv="refresh"' in app_mod.DONE_PAGE
+    assert "/download" not in app_mod.DONE_PAGE
+    assert not hasattr(app_mod, "_pending_downloads")
+
+
+def test_download_route_is_gone(client):
+    resp = client.get("/download/some-token")
+    assert resp.status_code == 404
 
 
 def test_rejoin_upload_rejects_unknown_session(client):

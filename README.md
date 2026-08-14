@@ -15,7 +15,7 @@ A small Flask app, deployed to a single-instance Google Cloud Run service in `us
 
 ### Export flow
 
-The user lands on `/` and authorizes Slack. The app fetches their channel list, builds a CSV plus a Markdown welcome-back checklist, DMs both files to them, and offers a one-shot browser download.
+The user lands on `/` and authorizes Slack. The app fetches their channel list, builds a CSV plus a Markdown welcome-back checklist, and DMs both files to them.
 
 ![Export landing page](./screenshots/export-landing.png)
 
@@ -47,8 +47,7 @@ _Rejoin completion. Slack's `conversations.join` returns success with a `warning
 |---|---|
 | `/` | Landing page for the export flow |
 | `/slack/auth` | Kicks off Slack OAuth for export |
-| `/slack/callback` | Receives OAuth code, fetches channels, builds CSV + Markdown, DMs both files to the user, offers a one-shot CSV download |
-| `/download/<token>` | One-shot, in-memory CSV download (token popped on first GET) |
+| `/slack/callback` | Receives OAuth code, fetches channels, builds CSV + Markdown, DMs both files to the user |
 | `/rejoin` | Landing page for the rejoin flow |
 | `/rejoin/auth` | Kicks off Slack OAuth for rejoin (smaller scope set) |
 | `/slack/rejoin_callback` | Receives OAuth code, sets a session cookie, redirects to upload form |

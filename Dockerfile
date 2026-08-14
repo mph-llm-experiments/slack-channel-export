@@ -12,7 +12,7 @@ RUN pip install -r requirements.txt
 COPY slack_channel_export_selfservice_1.py .
 
 # Cloud Run injects PORT (defaults to 8080). One worker keeps the
-# in-memory state store + download stash coherent; threads handle
+# in-memory rejoin session store coherent; threads handle
 # concurrent requests.
 CMD exec gunicorn \
     --bind :${PORT:-8080} \

@@ -1,4 +1,11 @@
-# Slack Channel Export & Rejoin
+# Slack Channel Tools
+
+Two related self-service Slack tools in one repo:
+
+- **Channel Export & Rejoin** (repo root) — the Flask app described below.
+- **`/mychannels` slash command** ([`mychannels/`](./mychannels/)) — a Slack Bolt app that lists a user's channel memberships on demand; admins can look up other users. Deployed as its own Cloud Run service — see [`mychannels/docs/DEPLOY.md`](./mychannels/docs/DEPLOY.md).
+
+## Channel Export & Rejoin
 
 Self-service tool that helps an employee:
 
@@ -174,10 +181,11 @@ For local OAuth you need `http://localhost:5001/slack/callback` (and `/slack/rej
 ## Project files
 
 ```
-slack_channel_export_selfservice_1.py   single-file Flask app
+slack_channel_export_selfservice_1.py   single-file Flask app (export + rejoin)
 requirements.txt                        flask, slack-sdk, gunicorn
 Dockerfile                              python:3.12-slim + gunicorn on $PORT
 .dockerignore                           keeps .venv, .git, etc. out of the build
 ARCHITECTURE.md                         design + threat model for review
 CLAUDE.md                               conventions for AI-assisted edits
+mychannels/                             /mychannels slash-command bot (own Dockerfile, tests, deploy doc)
 ```

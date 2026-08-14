@@ -4,9 +4,14 @@ Notes for future AI-assisted edits in this repo.
 
 ## What this is
 
-Single-file Flask app — `slack_channel_export_selfservice_1.py` — that runs both an export flow and a rejoin flow for Slack channel membership. Deployed to Google Cloud Run, fronted by Cloud IAP for end-user auth.
+Two Slack tools, two Cloud Run services, one repo:
 
-Read [ARCHITECTURE.md](./ARCHITECTURE.md) for the design + threat model. README.md has deploy steps.
+- **Repo root**: single-file Flask app — `slack_channel_export_selfservice_1.py` — that runs both an export flow and a rejoin flow for Slack channel membership. Deployed to Google Cloud Run (service `slack-channel-export`, project `slack-channel-export`, us-west1), fronted by Cloud IAP for end-user auth.
+- **`mychannels/`**: Slack Bolt app backing the `/mychannels` slash command. Own Dockerfile, tests, and deploy doc (`mychannels/docs/DEPLOY.md`). Deploy it with `--source mychannels`.
+
+Everything below this line is about the export/rejoin app unless it says otherwise. Read [ARCHITECTURE.md](./ARCHITECTURE.md) for its design + threat model. README.md has deploy steps.
+
+Root `pytest.ini` pins `testpaths = tests`, so running pytest at the root exercises only the export app. Run the mychannels suite from inside `mychannels/` with its own venv.
 
 ## Conventions worth keeping
 
